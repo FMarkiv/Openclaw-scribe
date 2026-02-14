@@ -50,6 +50,7 @@
 //! // Register tools in the agent loop
 //! let mut tools = markdown_tools::all_markdown_tools(md_mem);
 //! tools.extend(session_tools::all_session_tools(session_mgr));
+//! tools.extend(web_tools::all_web_tools(config.brave_api_key.clone()));
 //! ```
 
 pub mod context;
@@ -57,3 +58,4 @@ pub mod markdown;
 pub mod markdown_tools;
 pub mod session;
 pub mod session_tools;
+pub mod web_tools;

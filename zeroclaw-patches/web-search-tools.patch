@@ -1,0 +1,106 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1234567..abcdefg 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,7 @@
+ anyhow = "1"
+ async-trait = "0.1"
+ chrono = "0.4"
++reqwest = { version = "0.12", features = ["json"] }
+ uuid = { version = "1", features = ["v4"] }
+-reqwest = { version = "0.12", features = ["json"] }
+ rusqlite = { version = "0.31", features = ["bundled"] }
+ serde = { version = "1", features = ["derive"] }
++serde_json = "1"
+ tokio = { version = "1", features = ["full"] }
+diff --git a/src/config.rs b/src/config.rs
+index 1234567..abcdefg 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -28,6 +28,10 @@ pub struct Config {
+     /// Browser configuration for web-related tools.
+     #[serde(default)]
+     pub browser: BrowserConfig,
++
++    /// Brave Search API key for web_search tool.
++    /// Can also be set via BRAVE_API_KEY environment variable.
++    pub brave_api_key: Option<String>,
+ }
+
+ impl Config {
+@@ -48,6 +52,7 @@ impl Config {
+             composio_key: None,
+             memory: MemoryConfig::default(),
+             browser: BrowserConfig::default(),
++            brave_api_key: None,
+         }
+     }
+
+@@ -71,6 +76,13 @@ impl Config {
+             config.composio_key = Some(key);
+         }
+
++        // BRAVE_API_KEY env var overrides config.toml
++        if config.brave_api_key.is_none() {
++            if let Ok(key) = std::env::var("BRAVE_API_KEY") {
++                config.brave_api_key = Some(key);
++            }
++        }
++
+         config
+     }
+ }
+diff --git a/src/memory/mod.rs b/src/memory/mod.rs
+index abcdefg..1234567 100644
+--- a/src/memory/mod.rs
++++ b/src/memory/mod.rs
+@@ -4,6 +4,7 @@ pub mod markdown_tools;
+ pub mod session;
+ pub mod session_tools;
+ pub mod vector;
++pub mod web_tools;
+
+ pub use sqlite::SqliteMemory;
+ pub use markdown::MarkdownMemory;
+diff --git a/src/agent/loop_.rs b/src/agent/loop_.rs
+index 9876543..aabbccd 100644
+--- a/src/agent/loop_.rs
++++ b/src/agent/loop_.rs
+@@ -5,6 +5,7 @@
+ use crate::memory::markdown_tools;
+ use crate::memory::session::{SessionManager, SessionTurn, PersistedToolCall, PersistedToolResult};
+ use crate::memory::session_tools;
++use crate::memory::web_tools;
+ use crate::observability::{self, Observer, ObserverEvent};
+ use crate::providers::{self, ChatMessage, Provider, ToolDefinition};
+ use crate::runtime;
+@@ -261,6 +262,9 @@
+     // Register session persistence tools (/new, /sessions)
+     tools.extend(session_tools::all_session_tools(session_mgr.clone()));
+
++    // Register web research tools (web_search, web_fetch)
++    tools.extend(web_tools::all_web_tools(config.brave_api_key.clone()));
++
+     // ── Resolve provider ─────────────────────────────────────────
+
+--- /dev/null
++++ b/example-config.toml
+@@ -0,0 +1,18 @@
++# ZeroClaw Configuration
++# Location: ~/.zeroclaw/config.toml
++
++workspace = "."
++
++# Provider API keys (can also be set via environment variables)
++# anthropic_key = "sk-ant-..."
++# openai_key = "sk-..."
++# openrouter_key = "sk-or-..."
++
++# Brave Search API key for web_search tool.
++# Get a key at https://brave.com/search/api/
++# Can also be set via BRAVE_API_KEY environment variable.
++# brave_api_key = "BSA..."
++
++[memory]
++auto_save = true
++auto_context = true
