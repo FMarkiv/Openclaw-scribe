@@ -1,0 +1,2256 @@
+diff --git a/src/agent/loop_.rs b/src/agent/loop_.rs
+index 57e0182..8d2b0fb 100644
+--- a/src/agent/loop_.rs
++++ b/src/agent/loop_.rs
+@@ -1,15 +1,18 @@
+ use crate::config::Config;
+ use crate::memory::{self, Memory, MemoryCategory};
+ use crate::observability::{self, Observer, ObserverEvent};
+-use crate::providers::{self, Provider};
++use crate::providers::{self, ChatMessage, Provider, ToolDefinition};
+ use crate::runtime;
+ use crate::security::SecurityPolicy;
+-use crate::tools;
++use crate::tools::{self, Tool};
+ use anyhow::Result;
+ use std::fmt::Write;
+ use std::sync::Arc;
+ use std::time::Instant;
+ 
++/// Maximum number of tool-call round-trips before forcing a text response.
++const MAX_TOOL_ITERATIONS: usize = 25;
++
+ /// Build context preamble by searching memory for relevant entries
+ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+     let mut context = String::new();
+@@ -28,6 +31,107 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+     context
+ }
+ 
++/// Convert Tool implementations to ToolDefinition schemas for the provider API.
++fn tool_definitions(tools: &[Box<dyn Tool>]) -> Vec<ToolDefinition> {
++    tools
++        .iter()
++        .map(|t| ToolDefinition {
++            name: t.name().to_string(),
++            description: t.description().to_string(),
++            parameters: t.parameters_schema(),
++        })
++        .collect()
++}
++
++/// Execute a single tool call and return the result as a string.
++async fn execute_tool(tools: &[Box<dyn Tool>], name: &str, args: serde_json::Value) -> String {
++    let tool = tools.iter().find(|t| t.name() == name);
++    match tool {
++        Some(t) => match t.execute(args).await {
++            Ok(result) => {
++                if result.success {
++                    result.output
++                } else {
++                    format!(
++                        "Tool error: {}",
++                        result.error.unwrap_or_else(|| result.output)
++                    )
++                }
++            }
++            Err(e) => format!("Tool execution failed: {e}"),
++        },
++        None => format!("Unknown tool: {name}"),
++    }
++}
++
++/// Run the multi-turn agent loop: send messages → parse tool_calls → execute → repeat.
++async fn agent_loop(
++    provider: &dyn Provider,
++    system_prompt: &str,
++    initial_message: &str,
++    model: &str,
++    temperature: f64,
++    tools: &[Box<dyn Tool>],
++) -> Result<String> {
++    let tool_defs = tool_definitions(tools);
++    let mut messages = vec![ChatMessage::User(initial_message.to_string())];
++
++    for iteration in 0..MAX_TOOL_ITERATIONS {
++        let response = provider
++            .chat_with_tools(Some(system_prompt), &messages, model, temperature, &tool_defs)
++            .await?;
++
++        if !response.has_tool_calls() {
++            // Final text response — we're done
++            return Ok(response.content.unwrap_or_default());
++        }
++
++        // Log what the LLM wants to do
++        if let Some(text) = &response.content {
++            if !text.is_empty() {
++                println!("{text}");
++            }
++        }
++
++        for tc in &response.tool_calls {
++            tracing::info!(
++                tool = tc.name,
++                id = tc.id,
++                iteration,
++                "Executing tool call"
++            );
++        }
++
++        // Append the assistant message with tool calls
++        messages.push(ChatMessage::Assistant {
++            content: response.content.clone(),
++            tool_calls: response.tool_calls.clone(),
++        });
++
++        // Execute each tool and append results
++        for tc in &response.tool_calls {
++            let result = execute_tool(tools, &tc.name, tc.arguments.clone()).await;
++
++            tracing::debug!(
++                tool = tc.name,
++                id = tc.id,
++                output_len = result.len(),
++                "Tool result"
++            );
++
++            messages.push(ChatMessage::ToolResult {
++                tool_call_id: tc.id.clone(),
++                content: result,
++            });
++        }
++    }
++
++    anyhow::bail!(
++        "Agent loop exceeded {MAX_TOOL_ITERATIONS} tool-call iterations. \
++         The model may be stuck in a loop."
++    )
++}
++
+ #[allow(clippy::too_many_lines)]
+ pub async fn run(
+     config: Config,
+@@ -59,7 +163,7 @@ pub async fn run(
+     } else {
+         None
+     };
+-    let _tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
++    let tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+ 
+     // ── Resolve provider ─────────────────────────────────────────
+     let provider_name = provider_override
+@@ -122,9 +226,17 @@ pub async fn run(
+             format!("{context}{msg}")
+         };
+ 
+-        let response = provider
+-            .chat_with_system(Some(&system_prompt), &enriched, model_name, temperature)
+-            .await?;
++        // Run the multi-turn agent loop with tool execution
++        let response = agent_loop(
++            provider.as_ref(),
++            &system_prompt,
++            &enriched,
++            model_name,
++            temperature,
++            &tools,
++        )
++        .await?;
++
+         println!("{response}");
+ 
+         // Auto-save assistant response to daily log
+@@ -166,9 +278,17 @@ pub async fn run(
+                 format!("{context}{}", msg.content)
+             };
+ 
+-            let response = provider
+-                .chat_with_system(Some(&system_prompt), &enriched, model_name, temperature)
+-                .await?;
++            // Run the multi-turn agent loop with tool execution
++            let response = agent_loop(
++                provider.as_ref(),
++                &system_prompt,
++                &enriched,
++                model_name,
++                temperature,
++                &tools,
++            )
++            .await?;
++
+             println!("\n{response}\n");
+ 
+             if config.memory.auto_save {
+diff --git a/src/providers/anthropic.rs b/src/providers/anthropic.rs
+index 9cddba1..9382880 100644
+--- a/src/providers/anthropic.rs
++++ b/src/providers/anthropic.rs
+@@ -1,4 +1,6 @@
+-use crate::providers::traits::Provider;
++use crate::providers::traits::{
++    ChatMessage, Provider, ProviderResponse, ToolCall, ToolDefinition,
++};
+ use async_trait::async_trait;
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+@@ -8,30 +10,77 @@ pub struct AnthropicProvider {
+     client: Client,
+ }
+ 
++// ── Request types ────────────────────────────────────────────
++
+ #[derive(Debug, Serialize)]
+ struct ChatRequest {
+     model: String,
+     max_tokens: u32,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     system: Option<String>,
+-    messages: Vec<Message>,
++    messages: Vec<RequestMessage>,
+     temperature: f64,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    tools: Vec<AnthropicToolDef>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+-struct Message {
++struct RequestMessage {
+     role: String,
+-    content: String,
++    content: RequestContent,
++}
++
++/// Anthropic content: either a plain string or an array of content blocks.
++#[derive(Debug, Serialize)]
++#[serde(untagged)]
++enum RequestContent {
++    Text(String),
++    Blocks(Vec<RequestContentBlock>),
++}
++
++#[derive(Debug, Serialize)]
++#[serde(tag = "type")]
++enum RequestContentBlock {
++    #[serde(rename = "text")]
++    Text { text: String },
++    #[serde(rename = "tool_use")]
++    ToolUse {
++        id: String,
++        name: String,
++        input: serde_json::Value,
++    },
++    #[serde(rename = "tool_result")]
++    ToolResult {
++        tool_use_id: String,
++        content: String,
++    },
++}
++
++#[derive(Debug, Serialize)]
++struct AnthropicToolDef {
++    name: String,
++    description: String,
++    input_schema: serde_json::Value,
+ }
+ 
++// ── Response types ───────────────────────────────────────────
++
+ #[derive(Debug, Deserialize)]
+ struct ChatResponse {
+-    content: Vec<ContentBlock>,
++    content: Vec<ResponseContentBlock>,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+-struct ContentBlock {
+-    text: String,
++#[serde(tag = "type")]
++enum ResponseContentBlock {
++    #[serde(rename = "text")]
++    Text { text: String },
++    #[serde(rename = "tool_use")]
++    ToolUse {
++        id: String,
++        name: String,
++        input: serde_json::Value,
++    },
+ }
+ 
+ impl AnthropicProvider {
+@@ -45,6 +94,112 @@ impl AnthropicProvider {
+                 .unwrap_or_else(|_| Client::new()),
+         }
+     }
++
++    fn require_key(&self) -> anyhow::Result<&str> {
++        self.api_key.as_deref().ok_or_else(|| {
++            anyhow::anyhow!(
++                "Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml."
++            )
++        })
++    }
++}
++
++fn build_messages(messages: &[ChatMessage]) -> Vec<RequestMessage> {
++    let mut out = Vec::new();
++
++    for msg in messages {
++        match msg {
++            ChatMessage::User(text) => out.push(RequestMessage {
++                role: "user".into(),
++                content: RequestContent::Text(text.clone()),
++            }),
++            ChatMessage::Assistant {
++                content,
++                tool_calls,
++            } => {
++                if tool_calls.is_empty() {
++                    out.push(RequestMessage {
++                        role: "assistant".into(),
++                        content: RequestContent::Text(content.clone().unwrap_or_default()),
++                    });
++                } else {
++                    // Anthropic: assistant message has content blocks for tool_use
++                    let mut blocks = Vec::new();
++                    if let Some(text) = content {
++                        if !text.is_empty() {
++                            blocks.push(RequestContentBlock::Text { text: text.clone() });
++                        }
++                    }
++                    for tc in tool_calls {
++                        blocks.push(RequestContentBlock::ToolUse {
++                            id: tc.id.clone(),
++                            name: tc.name.clone(),
++                            input: tc.arguments.clone(),
++                        });
++                    }
++                    out.push(RequestMessage {
++                        role: "assistant".into(),
++                        content: RequestContent::Blocks(blocks),
++                    });
++                }
++            }
++            ChatMessage::ToolResult {
++                tool_call_id,
++                content,
++            } => {
++                // Anthropic: tool results go in a user-role message with tool_result blocks
++                out.push(RequestMessage {
++                    role: "user".into(),
++                    content: RequestContent::Blocks(vec![RequestContentBlock::ToolResult {
++                        tool_use_id: tool_call_id.clone(),
++                        content: content.clone(),
++                    }]),
++                });
++            }
++        }
++    }
++
++    out
++}
++
++fn build_tool_defs(tools: &[ToolDefinition]) -> Vec<AnthropicToolDef> {
++    tools
++        .iter()
++        .map(|t| AnthropicToolDef {
++            name: t.name.clone(),
++            description: t.description.clone(),
++            input_schema: t.parameters.clone(),
++        })
++        .collect()
++}
++
++fn parse_response(resp: ChatResponse) -> ProviderResponse {
++    let mut text_parts = Vec::new();
++    let mut tool_calls = Vec::new();
++
++    for block in resp.content {
++        match block {
++            ResponseContentBlock::Text { text } => text_parts.push(text),
++            ResponseContentBlock::ToolUse { id, name, input } => {
++                tool_calls.push(ToolCall {
++                    id,
++                    name,
++                    arguments: input,
++                });
++            }
++        }
++    }
++
++    let content = if text_parts.is_empty() {
++        None
++    } else {
++        Some(text_parts.join(""))
++    };
++
++    ProviderResponse {
++        content,
++        tool_calls,
++    }
+ }
+ 
+ #[async_trait]
+@@ -56,19 +211,31 @@ impl Provider for AnthropicProvider {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String> {
+-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+-            anyhow::anyhow!("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")
+-        })?;
++        let msgs = vec![ChatMessage::User(message.to_string())];
++        let resp = self
++            .chat_with_tools(system_prompt, &msgs, model, temperature, &[])
++            .await?;
++        resp.content
++            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
++    }
++
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
++        let api_key = self.require_key()?;
+ 
+         let request = ChatRequest {
+             model: model.to_string(),
+             max_tokens: 4096,
+             system: system_prompt.map(ToString::to_string),
+-            messages: vec![Message {
+-                role: "user".to_string(),
+-                content: message.to_string(),
+-            }],
++            messages: build_messages(messages),
+             temperature,
++            tools: build_tool_defs(tools),
+         };
+ 
+         let response = self
+@@ -87,13 +254,7 @@ impl Provider for AnthropicProvider {
+         }
+ 
+         let chat_response: ChatResponse = response.json().await?;
+-
+-        chat_response
+-            .content
+-            .into_iter()
+-            .next()
+-            .map(|c| c.text)
+-            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
++        Ok(parse_response(chat_response))
+     }
+ }
+ 
+@@ -150,19 +311,21 @@ mod tests {
+             model: "claude-3-opus".to_string(),
+             max_tokens: 4096,
+             system: None,
+-            messages: vec![Message {
+-                role: "user".to_string(),
+-                content: "hello".to_string(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: RequestContent::Text("hello".into()),
+             }],
+             temperature: 0.7,
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(
+-            !json.contains("system"),
++            !json.contains("\"system\""),
+             "system field should be skipped when None"
+         );
+         assert!(json.contains("claude-3-opus"));
+         assert!(json.contains("hello"));
++        assert!(!json.contains("\"tools\""));
+     }
+ 
+     #[test]
+@@ -171,11 +334,12 @@ mod tests {
+             model: "claude-3-opus".to_string(),
+             max_tokens: 4096,
+             system: Some("You are ZeroClaw".to_string()),
+-            messages: vec![Message {
+-                role: "user".to_string(),
+-                content: "hello".to_string(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: RequestContent::Text("hello".into()),
+             }],
+             temperature: 0.7,
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(json.contains("\"system\":\"You are ZeroClaw\""));
+@@ -186,7 +350,10 @@ mod tests {
+         let json = r#"{"content":[{"type":"text","text":"Hello there!"}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+         assert_eq!(resp.content.len(), 1);
+-        assert_eq!(resp.content[0].text, "Hello there!");
++        match &resp.content[0] {
++            ResponseContentBlock::Text { text } => assert_eq!(text, "Hello there!"),
++            _ => panic!("Expected text block"),
++        }
+     }
+ 
+     #[test]
+@@ -202,8 +369,120 @@ mod tests {
+             r#"{"content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+         assert_eq!(resp.content.len(), 2);
+-        assert_eq!(resp.content[0].text, "First");
+-        assert_eq!(resp.content[1].text, "Second");
++    }
++
++    #[test]
++    fn chat_response_with_tool_use() {
++        let json = r#"{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_1","name":"shell","input":{"command":"ls"}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        assert_eq!(resp.content.len(), 2);
++        match &resp.content[1] {
++            ResponseContentBlock::ToolUse { id, name, input } => {
++                assert_eq!(id, "toolu_1");
++                assert_eq!(name, "shell");
++                assert_eq!(input["command"], "ls");
++            }
++            _ => panic!("Expected tool_use block"),
++        }
++    }
++
++    #[test]
++    fn parse_response_text_only() {
++        let json = r#"{"content":[{"type":"text","text":"Hello!"}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(resp);
++        assert_eq!(pr.content.as_deref(), Some("Hello!"));
++        assert!(!pr.has_tool_calls());
++    }
++
++    #[test]
++    fn parse_response_tool_use_only() {
++        let json = r#"{"content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"command":"pwd"}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(resp);
++        assert!(pr.content.is_none());
++        assert!(pr.has_tool_calls());
++        assert_eq!(pr.tool_calls[0].name, "shell");
++        assert_eq!(pr.tool_calls[0].id, "toolu_1");
++    }
++
++    #[test]
++    fn parse_response_mixed() {
++        let json = r#"{"content":[{"type":"text","text":"Let me run that."},{"type":"tool_use","id":"toolu_1","name":"file_read","input":{"path":"main.rs"}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(resp);
++        assert_eq!(pr.content.as_deref(), Some("Let me run that."));
++        assert!(pr.has_tool_calls());
++        assert_eq!(pr.tool_calls[0].name, "file_read");
++    }
++
++    #[test]
++    fn build_messages_simple_user() {
++        let msgs = vec![ChatMessage::User("hello".into())];
++        let built = build_messages(&msgs);
++        assert_eq!(built.len(), 1);
++        assert_eq!(built[0].role, "user");
++    }
++
++    #[test]
++    fn build_messages_with_tool_result() {
++        let msgs = vec![
++            ChatMessage::User("list files".into()),
++            ChatMessage::Assistant {
++                content: Some("Sure.".into()),
++                tool_calls: vec![ToolCall {
++                    id: "toolu_1".into(),
++                    name: "shell".into(),
++                    arguments: serde_json::json!({"command": "ls"}),
++                }],
++            },
++            ChatMessage::ToolResult {
++                tool_call_id: "toolu_1".into(),
++                content: "file.txt".into(),
++            },
++        ];
++        let built = build_messages(&msgs);
++        assert_eq!(built.len(), 3);
++        assert_eq!(built[0].role, "user");
++        assert_eq!(built[1].role, "assistant");
++        assert_eq!(built[2].role, "user"); // Anthropic: tool results are user-role
++    }
++
++    #[test]
++    fn build_tool_defs_uses_input_schema() {
++        let defs = build_tool_defs(&[ToolDefinition {
++            name: "shell".into(),
++            description: "Execute commands".into(),
++            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
++        }]);
++        assert_eq!(defs.len(), 1);
++        assert_eq!(defs[0].name, "shell");
++        let json = serde_json::to_string(&defs[0]).unwrap();
++        assert!(json.contains("input_schema"));
++        assert!(!json.contains("\"parameters\""));
++    }
++
++    #[test]
++    fn request_serializes_with_tools() {
++        let req = ChatRequest {
++            model: "claude-3-opus".into(),
++            max_tokens: 4096,
++            system: None,
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: RequestContent::Text("test".into()),
++            }],
++            temperature: 0.7,
++            tools: vec![AnthropicToolDef {
++                name: "shell".into(),
++                description: "Run commands".into(),
++                input_schema: serde_json::json!({"type": "object"}),
++            }],
++        };
++        let json = serde_json::to_string(&req).unwrap();
++        assert!(json.contains("\"tools\""));
++        assert!(json.contains("\"input_schema\""));
++        assert!(json.contains("\"shell\""));
+     }
+ 
+     #[test]
+@@ -215,6 +494,7 @@ mod tests {
+                 system: None,
+                 messages: vec![],
+                 temperature: temp,
++                tools: vec![],
+             };
+             let json = serde_json::to_string(&req).unwrap();
+             assert!(json.contains(&format!("{temp}")));
+diff --git a/src/providers/compatible.rs b/src/providers/compatible.rs
+index 15f7a32..c2095c5 100644
+--- a/src/providers/compatible.rs
++++ b/src/providers/compatible.rs
+@@ -2,7 +2,9 @@
+ //! Most LLM APIs follow the same `/v1/chat/completions` format.
+ //! This module provides a single implementation that works for all of them.
+ 
+-use crate::providers::traits::Provider;
++use crate::providers::traits::{
++    ChatMessage, Provider, ProviderResponse, ToolCall, ToolDefinition,
++};
+ use async_trait::async_trait;
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+@@ -43,21 +45,79 @@ impl OpenAiCompatibleProvider {
+                 .unwrap_or_else(|_| Client::new()),
+         }
+     }
++
++    fn require_key(&self) -> anyhow::Result<&str> {
++        self.api_key.as_deref().ok_or_else(|| {
++            anyhow::anyhow!(
++                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
++                self.name
++            )
++        })
++    }
++
++    fn apply_auth(
++        &self,
++        req: reqwest::RequestBuilder,
++        api_key: &str,
++    ) -> reqwest::RequestBuilder {
++        match &self.auth_header {
++            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {api_key}")),
++            AuthStyle::XApiKey => req.header("x-api-key", api_key),
++            AuthStyle::Custom(header) => req.header(header.as_str(), api_key),
++        }
++    }
+ }
+ 
++// ── Request types ────────────────────────────────────────────
++
+ #[derive(Debug, Serialize)]
+ struct ChatRequest {
+     model: String,
+-    messages: Vec<Message>,
++    messages: Vec<RequestMessage>,
+     temperature: f64,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    tools: Vec<RequestToolDef>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+-struct Message {
++struct RequestMessage {
+     role: String,
+-    content: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    content: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_calls: Option<Vec<RequestToolCall>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_call_id: Option<String>,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestToolDef {
++    r#type: String,
++    function: RequestFunction,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestFunction {
++    name: String,
++    description: String,
++    parameters: serde_json::Value,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCall {
++    id: String,
++    r#type: String,
++    function: RequestToolCallFunction,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCallFunction {
++    name: String,
++    arguments: String,
+ }
+ 
++// ── Response types ───────────────────────────────────────────
++
+ #[derive(Debug, Deserialize)]
+ struct ChatResponse {
+     choices: Vec<Choice>,
+@@ -70,7 +130,128 @@ struct Choice {
+ 
+ #[derive(Debug, Deserialize)]
+ struct ResponseMessage {
+-    content: String,
++    content: Option<String>,
++    #[serde(default)]
++    tool_calls: Vec<ResponseToolCall>,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseToolCall {
++    id: String,
++    function: ResponseFunction,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseFunction {
++    name: String,
++    arguments: String,
++}
++
++// ── Helpers (shared OpenAI format logic) ─────────────────────
++
++fn build_messages(system_prompt: Option<&str>, messages: &[ChatMessage]) -> Vec<RequestMessage> {
++    let mut out = Vec::new();
++
++    if let Some(sys) = system_prompt {
++        out.push(RequestMessage {
++            role: "system".into(),
++            content: Some(sys.to_string()),
++            tool_calls: None,
++            tool_call_id: None,
++        });
++    }
++
++    for msg in messages {
++        match msg {
++            ChatMessage::User(text) => out.push(RequestMessage {
++                role: "user".into(),
++                content: Some(text.clone()),
++                tool_calls: None,
++                tool_call_id: None,
++            }),
++            ChatMessage::Assistant {
++                content,
++                tool_calls,
++            } => {
++                let tc = if tool_calls.is_empty() {
++                    None
++                } else {
++                    Some(
++                        tool_calls
++                            .iter()
++                            .map(|tc| RequestToolCall {
++                                id: tc.id.clone(),
++                                r#type: "function".into(),
++                                function: RequestToolCallFunction {
++                                    name: tc.name.clone(),
++                                    arguments: tc.arguments.to_string(),
++                                },
++                            })
++                            .collect(),
++                    )
++                };
++                out.push(RequestMessage {
++                    role: "assistant".into(),
++                    content: content.clone(),
++                    tool_calls: tc,
++                    tool_call_id: None,
++                });
++            }
++            ChatMessage::ToolResult {
++                tool_call_id,
++                content,
++            } => out.push(RequestMessage {
++                role: "tool".into(),
++                content: Some(content.clone()),
++                tool_calls: None,
++                tool_call_id: Some(tool_call_id.clone()),
++            }),
++        }
++    }
++
++    out
++}
++
++fn build_tool_defs(tools: &[ToolDefinition]) -> Vec<RequestToolDef> {
++    tools
++        .iter()
++        .map(|t| RequestToolDef {
++            r#type: "function".into(),
++            function: RequestFunction {
++                name: t.name.clone(),
++                description: t.description.clone(),
++                parameters: t.parameters.clone(),
++            },
++        })
++        .collect()
++}
++
++fn parse_response(resp: ChatResponse, provider_name: &str) -> anyhow::Result<ProviderResponse> {
++    let choice = resp
++        .choices
++        .into_iter()
++        .next()
++        .ok_or_else(|| anyhow::anyhow!("No response from {provider_name}"))?;
++
++    let tool_calls = choice
++        .message
++        .tool_calls
++        .into_iter()
++        .map(|tc| {
++            let args: serde_json::Value =
++                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
++            ToolCall {
++                id: tc.id,
++                name: tc.function.name,
++                arguments: args,
++            }
++        })
++        .collect();
++
++    Ok(ProviderResponse {
++        content: choice.message.content,
++        tool_calls,
++    })
+ }
+ 
+ #[async_trait]
+@@ -82,48 +263,34 @@ impl Provider for OpenAiCompatibleProvider {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String> {
+-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+-            anyhow::anyhow!(
+-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+-                self.name
+-            )
+-        })?;
+-
+-        let mut messages = Vec::new();
+-
+-        if let Some(sys) = system_prompt {
+-            messages.push(Message {
+-                role: "system".to_string(),
+-                content: sys.to_string(),
+-            });
+-        }
++        let msgs = vec![ChatMessage::User(message.to_string())];
++        let resp = self
++            .chat_with_tools(system_prompt, &msgs, model, temperature, &[])
++            .await?;
++        resp.content
++            .ok_or_else(|| anyhow::anyhow!("No text response from {}", self.name))
++    }
+ 
+-        messages.push(Message {
+-            role: "user".to_string(),
+-            content: message.to_string(),
+-        });
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
++        let api_key = self.require_key()?;
+ 
+         let request = ChatRequest {
+             model: model.to_string(),
+-            messages,
++            messages: build_messages(system_prompt, messages),
+             temperature,
++            tools: build_tool_defs(tools),
+         };
+ 
+         let url = format!("{}/v1/chat/completions", self.base_url);
+-
+-        let mut req = self.client.post(&url).json(&request);
+-
+-        match &self.auth_header {
+-            AuthStyle::Bearer => {
+-                req = req.header("Authorization", format!("Bearer {api_key}"));
+-            }
+-            AuthStyle::XApiKey => {
+-                req = req.header("x-api-key", api_key.as_str());
+-            }
+-            AuthStyle::Custom(header) => {
+-                req = req.header(header.as_str(), api_key.as_str());
+-            }
+-        }
++        let req = self.client.post(&url).json(&request);
++        let req = self.apply_auth(req, api_key);
+ 
+         let response = req.send().await?;
+ 
+@@ -133,13 +300,7 @@ impl Provider for OpenAiCompatibleProvider {
+         }
+ 
+         let chat_response: ChatResponse = response.json().await?;
+-
+-        chat_response
+-            .choices
+-            .into_iter()
+-            .next()
+-            .map(|c| c.message.content)
+-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
++        parse_response(chat_response, &self.name)
+     }
+ }
+ 
+@@ -189,28 +350,37 @@ mod tests {
+         let req = ChatRequest {
+             model: "llama-3.3-70b".to_string(),
+             messages: vec![
+-                Message {
+-                    role: "system".to_string(),
+-                    content: "You are ZeroClaw".to_string(),
++                RequestMessage {
++                    role: "system".into(),
++                    content: Some("You are ZeroClaw".into()),
++                    tool_calls: None,
++                    tool_call_id: None,
+                 },
+-                Message {
+-                    role: "user".to_string(),
+-                    content: "hello".to_string(),
++                RequestMessage {
++                    role: "user".into(),
++                    content: Some("hello".into()),
++                    tool_calls: None,
++                    tool_call_id: None,
+                 },
+             ],
+             temperature: 0.7,
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(json.contains("llama-3.3-70b"));
+         assert!(json.contains("system"));
+         assert!(json.contains("user"));
++        assert!(!json.contains("\"tools\""));
+     }
+ 
+     #[test]
+     fn response_deserializes() {
+         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+-        assert_eq!(resp.choices[0].message.content, "Hello from Venice!");
++        assert_eq!(
++            resp.choices[0].message.content.as_deref(),
++            Some("Hello from Venice!")
++        );
+     }
+ 
+     #[test]
+@@ -220,6 +390,25 @@ mod tests {
+         assert!(resp.choices.is_empty());
+     }
+ 
++    #[test]
++    fn response_with_tool_calls() {
++        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        assert!(resp.choices[0].message.content.is_none());
++        assert_eq!(resp.choices[0].message.tool_calls.len(), 1);
++        assert_eq!(resp.choices[0].message.tool_calls[0].function.name, "shell");
++    }
++
++    #[test]
++    fn parse_response_converts_tool_calls() {
++        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"test.rs\"}"}}]}}]}"#;
++        let chat_resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(chat_resp, "Test").unwrap();
++        assert!(pr.has_tool_calls());
++        assert_eq!(pr.tool_calls[0].name, "file_read");
++        assert_eq!(pr.tool_calls[0].arguments["path"], "test.rs");
++    }
++
+     #[test]
+     fn x_api_key_auth_style() {
+         let p = OpenAiCompatibleProvider::new(
+@@ -264,4 +453,54 @@ mod tests {
+             );
+         }
+     }
++
++    #[test]
++    fn request_serializes_with_tools() {
++        let req = ChatRequest {
++            model: "model".into(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: Some("test".into()),
++                tool_calls: None,
++                tool_call_id: None,
++            }],
++            temperature: 0.5,
++            tools: vec![RequestToolDef {
++                r#type: "function".into(),
++                function: RequestFunction {
++                    name: "shell".into(),
++                    description: "Execute commands".into(),
++                    parameters: serde_json::json!({"type": "object"}),
++                },
++            }],
++        };
++        let json = serde_json::to_string(&req).unwrap();
++        assert!(json.contains("\"tools\""));
++        assert!(json.contains("\"shell\""));
++    }
++
++    #[test]
++    fn build_messages_multi_turn() {
++        let msgs = vec![
++            ChatMessage::User("hi".into()),
++            ChatMessage::Assistant {
++                content: None,
++                tool_calls: vec![ToolCall {
++                    id: "c1".into(),
++                    name: "shell".into(),
++                    arguments: serde_json::json!({"command": "ls"}),
++                }],
++            },
++            ChatMessage::ToolResult {
++                tool_call_id: "c1".into(),
++                content: "file.txt".into(),
++            },
++        ];
++        let built = build_messages(Some("sys"), &msgs);
++        assert_eq!(built.len(), 4);
++        assert_eq!(built[0].role, "system");
++        assert_eq!(built[1].role, "user");
++        assert_eq!(built[2].role, "assistant");
++        assert_eq!(built[3].role, "tool");
++    }
+ }
+diff --git a/src/providers/mod.rs b/src/providers/mod.rs
+index 83c5392..f773fef 100644
+--- a/src/providers/mod.rs
++++ b/src/providers/mod.rs
+@@ -5,7 +5,7 @@ pub mod openai;
+ pub mod openrouter;
+ pub mod traits;
+ 
+-pub use traits::Provider;
++pub use traits::{ChatMessage, Provider, ToolDefinition};
+ 
+ use compatible::{AuthStyle, OpenAiCompatibleProvider};
+ 
+diff --git a/src/providers/ollama.rs b/src/providers/ollama.rs
+index adc3e6e..cf8815c 100644
+--- a/src/providers/ollama.rs
++++ b/src/providers/ollama.rs
+@@ -1,4 +1,6 @@
+-use crate::providers::traits::Provider;
++use crate::providers::traits::{
++    ChatMessage, Provider, ProviderResponse, ToolCall, ToolDefinition,
++};
+ use async_trait::async_trait;
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+@@ -8,18 +10,25 @@ pub struct OllamaProvider {
+     client: Client,
+ }
+ 
++// ── Request types ────────────────────────────────────────────
++
+ #[derive(Debug, Serialize)]
+ struct ChatRequest {
+     model: String,
+-    messages: Vec<Message>,
++    messages: Vec<RequestMessage>,
+     stream: bool,
+     options: Options,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    tools: Vec<RequestToolDef>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+-struct Message {
++struct RequestMessage {
+     role: String,
+-    content: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    content: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_calls: Option<Vec<RequestToolCall>>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+@@ -27,6 +36,32 @@ struct Options {
+     temperature: f64,
+ }
+ 
++#[derive(Debug, Serialize)]
++struct RequestToolDef {
++    r#type: String,
++    function: RequestFunction,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestFunction {
++    name: String,
++    description: String,
++    parameters: serde_json::Value,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCall {
++    function: RequestToolCallFunction,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCallFunction {
++    name: String,
++    arguments: serde_json::Value,
++}
++
++// ── Response types ───────────────────────────────────────────
++
+ #[derive(Debug, Deserialize)]
+ struct ChatResponse {
+     message: ResponseMessage,
+@@ -34,7 +69,20 @@ struct ChatResponse {
+ 
+ #[derive(Debug, Deserialize)]
+ struct ResponseMessage {
+-    content: String,
++    content: Option<String>,
++    #[serde(default)]
++    tool_calls: Vec<ResponseToolCall>,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseToolCall {
++    function: ResponseFunction,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseFunction {
++    name: String,
++    arguments: serde_json::Value,
+ }
+ 
+ impl OllamaProvider {
+@@ -53,6 +101,96 @@ impl OllamaProvider {
+     }
+ }
+ 
++fn build_messages(system_prompt: Option<&str>, messages: &[ChatMessage]) -> Vec<RequestMessage> {
++    let mut out = Vec::new();
++
++    if let Some(sys) = system_prompt {
++        out.push(RequestMessage {
++            role: "system".into(),
++            content: Some(sys.to_string()),
++            tool_calls: None,
++        });
++    }
++
++    for msg in messages {
++        match msg {
++            ChatMessage::User(text) => out.push(RequestMessage {
++                role: "user".into(),
++                content: Some(text.clone()),
++                tool_calls: None,
++            }),
++            ChatMessage::Assistant {
++                content,
++                tool_calls,
++            } => {
++                let tc = if tool_calls.is_empty() {
++                    None
++                } else {
++                    Some(
++                        tool_calls
++                            .iter()
++                            .map(|tc| RequestToolCall {
++                                function: RequestToolCallFunction {
++                                    name: tc.name.clone(),
++                                    arguments: tc.arguments.clone(),
++                                },
++                            })
++                            .collect(),
++                    )
++                };
++                out.push(RequestMessage {
++                    role: "assistant".into(),
++                    content: content.clone(),
++                    tool_calls: tc,
++                });
++            }
++            ChatMessage::ToolResult { content, .. } => out.push(RequestMessage {
++                role: "tool".into(),
++                content: Some(content.clone()),
++                tool_calls: None,
++            }),
++        }
++    }
++
++    out
++}
++
++fn build_tool_defs(tools: &[ToolDefinition]) -> Vec<RequestToolDef> {
++    tools
++        .iter()
++        .map(|t| RequestToolDef {
++            r#type: "function".into(),
++            function: RequestFunction {
++                name: t.name.clone(),
++                description: t.description.clone(),
++                parameters: t.parameters.clone(),
++            },
++        })
++        .collect()
++}
++
++fn parse_response(resp: ChatResponse) -> ProviderResponse {
++    let mut tc_counter = 0u64;
++    let tool_calls = resp
++        .message
++        .tool_calls
++        .into_iter()
++        .map(|tc| {
++            tc_counter += 1;
++            ToolCall {
++                id: format!("ollama_{tc_counter}"),
++                name: tc.function.name,
++                arguments: tc.function.arguments,
++            }
++        })
++        .collect();
++
++    ProviderResponse {
++        content: resp.message.content,
++        tool_calls,
++    }
++}
++
+ #[async_trait]
+ impl Provider for OllamaProvider {
+     async fn chat_with_system(
+@@ -62,25 +200,27 @@ impl Provider for OllamaProvider {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String> {
+-        let mut messages = Vec::new();
+-
+-        if let Some(sys) = system_prompt {
+-            messages.push(Message {
+-                role: "system".to_string(),
+-                content: sys.to_string(),
+-            });
+-        }
+-
+-        messages.push(Message {
+-            role: "user".to_string(),
+-            content: message.to_string(),
+-        });
++        let msgs = vec![ChatMessage::User(message.to_string())];
++        let resp = self
++            .chat_with_tools(system_prompt, &msgs, model, temperature, &[])
++            .await?;
++        Ok(resp.content.unwrap_or_default())
++    }
+ 
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
+         let request = ChatRequest {
+             model: model.to_string(),
+-            messages,
++            messages: build_messages(system_prompt, messages),
+             stream: false,
+             options: Options { temperature },
++            tools: build_tool_defs(tools),
+         };
+ 
+         let url = format!("{}/api/chat", self.base_url);
+@@ -95,7 +235,7 @@ impl Provider for OllamaProvider {
+         }
+ 
+         let chat_response: ChatResponse = response.json().await?;
+-        Ok(chat_response.message.content)
++        Ok(parse_response(chat_response))
+     }
+ }
+ 
+@@ -132,35 +272,41 @@ mod tests {
+         let req = ChatRequest {
+             model: "llama3".to_string(),
+             messages: vec![
+-                Message {
+-                    role: "system".to_string(),
+-                    content: "You are ZeroClaw".to_string(),
++                RequestMessage {
++                    role: "system".into(),
++                    content: Some("You are ZeroClaw".into()),
++                    tool_calls: None,
+                 },
+-                Message {
+-                    role: "user".to_string(),
+-                    content: "hello".to_string(),
++                RequestMessage {
++                    role: "user".into(),
++                    content: Some("hello".into()),
++                    tool_calls: None,
+                 },
+             ],
+             stream: false,
+             options: Options { temperature: 0.7 },
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(json.contains("\"stream\":false"));
+         assert!(json.contains("llama3"));
+         assert!(json.contains("system"));
+         assert!(json.contains("\"temperature\":0.7"));
++        assert!(!json.contains("\"tools\""));
+     }
+ 
+     #[test]
+     fn request_serializes_without_system() {
+         let req = ChatRequest {
+             model: "mistral".to_string(),
+-            messages: vec![Message {
+-                role: "user".to_string(),
+-                content: "test".to_string(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: Some("test".into()),
++                tool_calls: None,
+             }],
+             stream: false,
+             options: Options { temperature: 0.0 },
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(!json.contains("\"role\":\"system\""));
+@@ -171,20 +317,38 @@ mod tests {
+     fn response_deserializes() {
+         let json = r#"{"message":{"role":"assistant","content":"Hello from Ollama!"}}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+-        assert_eq!(resp.message.content, "Hello from Ollama!");
++        assert_eq!(resp.message.content.as_deref(), Some("Hello from Ollama!"));
+     }
+ 
+     #[test]
+     fn response_with_empty_content() {
+         let json = r#"{"message":{"role":"assistant","content":""}}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+-        assert!(resp.message.content.is_empty());
++        assert_eq!(resp.message.content.as_deref(), Some(""));
+     }
+ 
+     #[test]
+     fn response_with_multiline() {
+         let json = r#"{"message":{"role":"assistant","content":"line1\nline2\nline3"}}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+-        assert!(resp.message.content.contains("line1"));
++        assert!(resp.message.content.as_ref().unwrap().contains("line1"));
++    }
++
++    #[test]
++    fn response_with_tool_calls() {
++        let json = r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"shell","arguments":{"command":"ls"}}}]}}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        assert_eq!(resp.message.tool_calls.len(), 1);
++        assert_eq!(resp.message.tool_calls[0].function.name, "shell");
++    }
++
++    #[test]
++    fn parse_response_generates_ids() {
++        let json = r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"shell","arguments":{"command":"pwd"}}},{"function":{"name":"file_read","arguments":{"path":"test.rs"}}}]}}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(resp);
++        assert_eq!(pr.tool_calls.len(), 2);
++        assert_eq!(pr.tool_calls[0].id, "ollama_1");
++        assert_eq!(pr.tool_calls[1].id, "ollama_2");
+     }
+ }
+diff --git a/src/providers/openai.rs b/src/providers/openai.rs
+index 3481ce4..af000b6 100644
+--- a/src/providers/openai.rs
++++ b/src/providers/openai.rs
+@@ -1,4 +1,6 @@
+-use crate::providers::traits::Provider;
++use crate::providers::traits::{
++    ChatMessage, Provider, ProviderResponse, ToolCall, ToolDefinition,
++};
+ use async_trait::async_trait;
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+@@ -8,19 +10,56 @@ pub struct OpenAiProvider {
+     client: Client,
+ }
+ 
++// ── Request types ────────────────────────────────────────────
++
+ #[derive(Debug, Serialize)]
+ struct ChatRequest {
+     model: String,
+-    messages: Vec<Message>,
++    messages: Vec<RequestMessage>,
+     temperature: f64,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    tools: Vec<RequestToolDef>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+-struct Message {
++struct RequestMessage {
+     role: String,
+-    content: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    content: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_calls: Option<Vec<RequestToolCall>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_call_id: Option<String>,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestToolDef {
++    r#type: String,
++    function: RequestFunction,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestFunction {
++    name: String,
++    description: String,
++    parameters: serde_json::Value,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCall {
++    id: String,
++    r#type: String,
++    function: RequestToolCallFunction,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCallFunction {
++    name: String,
++    arguments: String,
++}
++
++// ── Response types ───────────────────────────────────────────
++
+ #[derive(Debug, Deserialize)]
+ struct ChatResponse {
+     choices: Vec<Choice>,
+@@ -33,7 +72,21 @@ struct Choice {
+ 
+ #[derive(Debug, Deserialize)]
+ struct ResponseMessage {
+-    content: String,
++    content: Option<String>,
++    #[serde(default)]
++    tool_calls: Vec<ResponseToolCall>,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseToolCall {
++    id: String,
++    function: ResponseFunction,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseFunction {
++    name: String,
++    arguments: String,
+ }
+ 
+ impl OpenAiProvider {
+@@ -47,6 +100,120 @@ impl OpenAiProvider {
+                 .unwrap_or_else(|_| Client::new()),
+         }
+     }
++
++    fn require_key(&self) -> anyhow::Result<&str> {
++        self.api_key
++            .as_deref()
++            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))
++    }
++}
++
++/// Convert common ChatMessage list to OpenAI request messages.
++fn build_messages(system_prompt: Option<&str>, messages: &[ChatMessage]) -> Vec<RequestMessage> {
++    let mut out = Vec::new();
++
++    if let Some(sys) = system_prompt {
++        out.push(RequestMessage {
++            role: "system".into(),
++            content: Some(sys.to_string()),
++            tool_calls: None,
++            tool_call_id: None,
++        });
++    }
++
++    for msg in messages {
++        match msg {
++            ChatMessage::User(text) => out.push(RequestMessage {
++                role: "user".into(),
++                content: Some(text.clone()),
++                tool_calls: None,
++                tool_call_id: None,
++            }),
++            ChatMessage::Assistant {
++                content,
++                tool_calls,
++            } => {
++                let tc = if tool_calls.is_empty() {
++                    None
++                } else {
++                    Some(
++                        tool_calls
++                            .iter()
++                            .map(|tc| RequestToolCall {
++                                id: tc.id.clone(),
++                                r#type: "function".into(),
++                                function: RequestToolCallFunction {
++                                    name: tc.name.clone(),
++                                    arguments: tc.arguments.to_string(),
++                                },
++                            })
++                            .collect(),
++                    )
++                };
++                out.push(RequestMessage {
++                    role: "assistant".into(),
++                    content: content.clone(),
++                    tool_calls: tc,
++                    tool_call_id: None,
++                });
++            }
++            ChatMessage::ToolResult {
++                tool_call_id,
++                content,
++            } => out.push(RequestMessage {
++                role: "tool".into(),
++                content: Some(content.clone()),
++                tool_calls: None,
++                tool_call_id: Some(tool_call_id.clone()),
++            }),
++        }
++    }
++
++    out
++}
++
++/// Convert ToolDefinition list to OpenAI tools format.
++fn build_tool_defs(tools: &[ToolDefinition]) -> Vec<RequestToolDef> {
++    tools
++        .iter()
++        .map(|t| RequestToolDef {
++            r#type: "function".into(),
++            function: RequestFunction {
++                name: t.name.clone(),
++                description: t.description.clone(),
++                parameters: t.parameters.clone(),
++            },
++        })
++        .collect()
++}
++
++/// Parse response into ProviderResponse.
++fn parse_response(resp: ChatResponse) -> anyhow::Result<ProviderResponse> {
++    let choice = resp
++        .choices
++        .into_iter()
++        .next()
++        .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
++
++    let tool_calls = choice
++        .message
++        .tool_calls
++        .into_iter()
++        .map(|tc| {
++            let args: serde_json::Value =
++                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
++            ToolCall {
++                id: tc.id,
++                name: tc.function.name,
++                arguments: args,
++            }
++        })
++        .collect();
++
++    Ok(ProviderResponse {
++        content: choice.message.content,
++        tool_calls,
++    })
+ }
+ 
+ #[async_trait]
+@@ -58,28 +225,29 @@ impl Provider for OpenAiProvider {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String> {
+-        let api_key = self.api_key.as_ref().ok_or_else(|| {
+-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+-        })?;
+-
+-        let mut messages = Vec::new();
+-
+-        if let Some(sys) = system_prompt {
+-            messages.push(Message {
+-                role: "system".to_string(),
+-                content: sys.to_string(),
+-            });
+-        }
++        let msgs = vec![ChatMessage::User(message.to_string())];
++        let resp = self
++            .chat_with_tools(system_prompt, &msgs, model, temperature, &[])
++            .await?;
++        resp.content
++            .ok_or_else(|| anyhow::anyhow!("No text response from OpenAI"))
++    }
+ 
+-        messages.push(Message {
+-            role: "user".to_string(),
+-            content: message.to_string(),
+-        });
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
++        let api_key = self.require_key()?;
+ 
+         let request = ChatRequest {
+             model: model.to_string(),
+-            messages,
++            messages: build_messages(system_prompt, messages),
+             temperature,
++            tools: build_tool_defs(tools),
+         };
+ 
+         let response = self
+@@ -96,13 +264,7 @@ impl Provider for OpenAiProvider {
+         }
+ 
+         let chat_response: ChatResponse = response.json().await?;
+-
+-        chat_response
+-            .choices
+-            .into_iter()
+-            .next()
+-            .map(|c| c.message.content)
+-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
++        parse_response(chat_response)
+     }
+ }
+ 
+@@ -150,32 +312,42 @@ mod tests {
+         let req = ChatRequest {
+             model: "gpt-4o".to_string(),
+             messages: vec![
+-                Message {
+-                    role: "system".to_string(),
+-                    content: "You are ZeroClaw".to_string(),
++                RequestMessage {
++                    role: "system".into(),
++                    content: Some("You are ZeroClaw".into()),
++                    tool_calls: None,
++                    tool_call_id: None,
+                 },
+-                Message {
+-                    role: "user".to_string(),
+-                    content: "hello".to_string(),
++                RequestMessage {
++                    role: "user".into(),
++                    content: Some("hello".into()),
++                    tool_calls: None,
++                    tool_call_id: None,
+                 },
+             ],
+             temperature: 0.7,
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(json.contains("\"role\":\"system\""));
+         assert!(json.contains("\"role\":\"user\""));
+         assert!(json.contains("gpt-4o"));
++        // Empty tools vec should be omitted
++        assert!(!json.contains("\"tools\""));
+     }
+ 
+     #[test]
+     fn request_serializes_without_system() {
+         let req = ChatRequest {
+             model: "gpt-4o".to_string(),
+-            messages: vec![Message {
+-                role: "user".to_string(),
+-                content: "hello".to_string(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: Some("hello".into()),
++                tool_calls: None,
++                tool_call_id: None,
+             }],
+             temperature: 0.0,
++            tools: vec![],
+         };
+         let json = serde_json::to_string(&req).unwrap();
+         assert!(!json.contains("system"));
+@@ -187,7 +359,7 @@ mod tests {
+         let json = r#"{"choices":[{"message":{"content":"Hi!"}}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+         assert_eq!(resp.choices.len(), 1);
+-        assert_eq!(resp.choices[0].message.content, "Hi!");
++        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hi!"));
+     }
+ 
+     #[test]
+@@ -202,14 +374,17 @@ mod tests {
+         let json = r#"{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+         assert_eq!(resp.choices.len(), 2);
+-        assert_eq!(resp.choices[0].message.content, "A");
++        assert_eq!(resp.choices[0].message.content.as_deref(), Some("A"));
+     }
+ 
+     #[test]
+     fn response_with_unicode() {
+         let json = r#"{"choices":[{"message":{"content":"こんにちは 🦀"}}]}"#;
+         let resp: ChatResponse = serde_json::from_str(json).unwrap();
+-        assert_eq!(resp.choices[0].message.content, "こんにちは 🦀");
++        assert_eq!(
++            resp.choices[0].message.content.as_deref(),
++            Some("こんにちは 🦀")
++        );
+     }
+ 
+     #[test]
+@@ -217,6 +392,111 @@ mod tests {
+         let long = "x".repeat(100_000);
+         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
+         let resp: ChatResponse = serde_json::from_str(&json).unwrap();
+-        assert_eq!(resp.choices[0].message.content.len(), 100_000);
++        assert_eq!(resp.choices[0].message.content.as_ref().unwrap().len(), 100_000);
++    }
++
++    #[test]
++    fn response_with_tool_calls() {
++        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        assert!(resp.choices[0].message.content.is_none());
++        assert_eq!(resp.choices[0].message.tool_calls.len(), 1);
++        assert_eq!(resp.choices[0].message.tool_calls[0].function.name, "shell");
++    }
++
++    #[test]
++    fn response_with_content_and_tool_calls() {
++        let json = r#"{"choices":[{"message":{"content":"Let me check.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"main.rs\"}"}}]}}]}"#;
++        let resp: ChatResponse = serde_json::from_str(json).unwrap();
++        assert_eq!(
++            resp.choices[0].message.content.as_deref(),
++            Some("Let me check.")
++        );
++        assert_eq!(resp.choices[0].message.tool_calls.len(), 1);
++    }
++
++    #[test]
++    fn parse_response_converts_tool_calls() {
++        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
++        let chat_resp: ChatResponse = serde_json::from_str(json).unwrap();
++        let pr = parse_response(chat_resp).unwrap();
++        assert!(pr.content.is_none());
++        assert!(pr.has_tool_calls());
++        assert_eq!(pr.tool_calls[0].name, "shell");
++        assert_eq!(pr.tool_calls[0].id, "call_abc");
++        assert_eq!(pr.tool_calls[0].arguments["command"], "pwd");
++    }
++
++    #[test]
++    fn build_messages_with_system() {
++        let msgs = vec![ChatMessage::User("hi".into())];
++        let built = build_messages(Some("sys"), &msgs);
++        assert_eq!(built.len(), 2);
++        assert_eq!(built[0].role, "system");
++        assert_eq!(built[1].role, "user");
++    }
++
++    #[test]
++    fn build_messages_with_tool_result() {
++        let msgs = vec![
++            ChatMessage::User("read file".into()),
++            ChatMessage::Assistant {
++                content: None,
++                tool_calls: vec![ToolCall {
++                    id: "call_1".into(),
++                    name: "file_read".into(),
++                    arguments: serde_json::json!({"path": "test.rs"}),
++                }],
++            },
++            ChatMessage::ToolResult {
++                tool_call_id: "call_1".into(),
++                content: "fn main() {}".into(),
++            },
++        ];
++        let built = build_messages(None, &msgs);
++        assert_eq!(built.len(), 3);
++        assert_eq!(built[0].role, "user");
++        assert_eq!(built[1].role, "assistant");
++        assert!(built[1].tool_calls.is_some());
++        assert_eq!(built[2].role, "tool");
++        assert_eq!(built[2].tool_call_id.as_deref(), Some("call_1"));
++    }
++
++    #[test]
++    fn build_tool_defs_creates_function_type() {
++        let defs = build_tool_defs(&[ToolDefinition {
++            name: "shell".into(),
++            description: "Execute commands".into(),
++            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
++        }]);
++        assert_eq!(defs.len(), 1);
++        assert_eq!(defs[0].r#type, "function");
++        assert_eq!(defs[0].function.name, "shell");
++    }
++
++    #[test]
++    fn request_serializes_with_tools() {
++        let req = ChatRequest {
++            model: "gpt-4o".into(),
++            messages: vec![RequestMessage {
++                role: "user".into(),
++                content: Some("list files".into()),
++                tool_calls: None,
++                tool_call_id: None,
++            }],
++            temperature: 0.7,
++            tools: vec![RequestToolDef {
++                r#type: "function".into(),
++                function: RequestFunction {
++                    name: "shell".into(),
++                    description: "Run commands".into(),
++                    parameters: serde_json::json!({"type": "object"}),
++                },
++            }],
++        };
++        let json = serde_json::to_string(&req).unwrap();
++        assert!(json.contains("\"tools\""));
++        assert!(json.contains("\"function\""));
++        assert!(json.contains("\"shell\""));
+     }
+ }
+diff --git a/src/providers/openrouter.rs b/src/providers/openrouter.rs
+index 3d99481..ae2b6c0 100644
+--- a/src/providers/openrouter.rs
++++ b/src/providers/openrouter.rs
+@@ -1,4 +1,6 @@
+-use crate::providers::traits::Provider;
++use crate::providers::traits::{
++    ChatMessage, Provider, ProviderResponse, ToolCall, ToolDefinition,
++};
+ use async_trait::async_trait;
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+@@ -8,19 +10,56 @@ pub struct OpenRouterProvider {
+     client: Client,
+ }
+ 
++// ── Request types (OpenAI-compatible) ────────────────────────
++
+ #[derive(Debug, Serialize)]
+ struct ChatRequest {
+     model: String,
+-    messages: Vec<Message>,
++    messages: Vec<RequestMessage>,
+     temperature: f64,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    tools: Vec<RequestToolDef>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+-struct Message {
++struct RequestMessage {
+     role: String,
+-    content: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    content: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_calls: Option<Vec<RequestToolCall>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    tool_call_id: Option<String>,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestToolDef {
++    r#type: String,
++    function: RequestFunction,
++}
++
++#[derive(Debug, Serialize)]
++struct RequestFunction {
++    name: String,
++    description: String,
++    parameters: serde_json::Value,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCall {
++    id: String,
++    r#type: String,
++    function: RequestToolCallFunction,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct RequestToolCallFunction {
++    name: String,
++    arguments: String,
++}
++
++// ── Response types ───────────────────────────────────────────
++
+ #[derive(Debug, Deserialize)]
+ struct ChatResponse {
+     choices: Vec<Choice>,
+@@ -33,7 +72,21 @@ struct Choice {
+ 
+ #[derive(Debug, Deserialize)]
+ struct ResponseMessage {
+-    content: String,
++    content: Option<String>,
++    #[serde(default)]
++    tool_calls: Vec<ResponseToolCall>,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseToolCall {
++    id: String,
++    function: ResponseFunction,
++}
++
++#[derive(Debug, Deserialize)]
++struct ResponseFunction {
++    name: String,
++    arguments: String,
+ }
+ 
+ impl OpenRouterProvider {
+@@ -47,6 +100,119 @@ impl OpenRouterProvider {
+                 .unwrap_or_else(|_| Client::new()),
+         }
+     }
++
++    fn require_key(&self) -> anyhow::Result<&str> {
++        self.api_key.as_deref().ok_or_else(|| {
++            anyhow::anyhow!(
++                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
++            )
++        })
++    }
++}
++
++fn build_messages(system_prompt: Option<&str>, messages: &[ChatMessage]) -> Vec<RequestMessage> {
++    let mut out = Vec::new();
++
++    if let Some(sys) = system_prompt {
++        out.push(RequestMessage {
++            role: "system".into(),
++            content: Some(sys.to_string()),
++            tool_calls: None,
++            tool_call_id: None,
++        });
++    }
++
++    for msg in messages {
++        match msg {
++            ChatMessage::User(text) => out.push(RequestMessage {
++                role: "user".into(),
++                content: Some(text.clone()),
++                tool_calls: None,
++                tool_call_id: None,
++            }),
++            ChatMessage::Assistant {
++                content,
++                tool_calls,
++            } => {
++                let tc = if tool_calls.is_empty() {
++                    None
++                } else {
++                    Some(
++                        tool_calls
++                            .iter()
++                            .map(|tc| RequestToolCall {
++                                id: tc.id.clone(),
++                                r#type: "function".into(),
++                                function: RequestToolCallFunction {
++                                    name: tc.name.clone(),
++                                    arguments: tc.arguments.to_string(),
++                                },
++                            })
++                            .collect(),
++                    )
++                };
++                out.push(RequestMessage {
++                    role: "assistant".into(),
++                    content: content.clone(),
++                    tool_calls: tc,
++                    tool_call_id: None,
++                });
++            }
++            ChatMessage::ToolResult {
++                tool_call_id,
++                content,
++            } => out.push(RequestMessage {
++                role: "tool".into(),
++                content: Some(content.clone()),
++                tool_calls: None,
++                tool_call_id: Some(tool_call_id.clone()),
++            }),
++        }
++    }
++
++    out
++}
++
++fn build_tool_defs(tools: &[ToolDefinition]) -> Vec<RequestToolDef> {
++    tools
++        .iter()
++        .map(|t| RequestToolDef {
++            r#type: "function".into(),
++            function: RequestFunction {
++                name: t.name.clone(),
++                description: t.description.clone(),
++                parameters: t.parameters.clone(),
++            },
++        })
++        .collect()
++}
++
++fn parse_response(resp: ChatResponse) -> anyhow::Result<ProviderResponse> {
++    let choice = resp
++        .choices
++        .into_iter()
++        .next()
++        .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
++
++    let tool_calls = choice
++        .message
++        .tool_calls
++        .into_iter()
++        .map(|tc| {
++            let args: serde_json::Value =
++                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
++            ToolCall {
++                id: tc.id,
++                name: tc.function.name,
++                arguments: args,
++            }
++        })
++        .collect();
++
++    Ok(ProviderResponse {
++        content: choice.message.content,
++        tool_calls,
++    })
+ }
+ 
+ #[async_trait]
+@@ -58,27 +224,29 @@ impl Provider for OpenRouterProvider {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String> {
+-        let api_key = self.api_key.as_ref()
+-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+-
+-        let mut messages = Vec::new();
+-
+-        if let Some(sys) = system_prompt {
+-            messages.push(Message {
+-                role: "system".to_string(),
+-                content: sys.to_string(),
+-            });
+-        }
++        let msgs = vec![ChatMessage::User(message.to_string())];
++        let resp = self
++            .chat_with_tools(system_prompt, &msgs, model, temperature, &[])
++            .await?;
++        resp.content
++            .ok_or_else(|| anyhow::anyhow!("No text response from OpenRouter"))
++    }
+ 
+-        messages.push(Message {
+-            role: "user".to_string(),
+-            content: message.to_string(),
+-        });
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
++        let api_key = self.require_key()?;
+ 
+         let request = ChatRequest {
+             model: model.to_string(),
+-            messages,
++            messages: build_messages(system_prompt, messages),
+             temperature,
++            tools: build_tool_defs(tools),
+         };
+ 
+         let response = self
+@@ -100,12 +268,6 @@ impl Provider for OpenRouterProvider {
+         }
+ 
+         let chat_response: ChatResponse = response.json().await?;
+-
+-        chat_response
+-            .choices
+-            .into_iter()
+-            .next()
+-            .map(|c| c.message.content)
+-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
++        parse_response(chat_response)
+     }
+ }
+diff --git a/src/providers/traits.rs b/src/providers/traits.rs
+index 8a24714..71007f3 100644
+--- a/src/providers/traits.rs
++++ b/src/providers/traits.rs
+@@ -1,4 +1,50 @@
+ use async_trait::async_trait;
++use serde::{Deserialize, Serialize};
++
++// ── Common types for multi-turn tool calling ──────────────────
++
++/// A tool definition sent to the LLM.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ToolDefinition {
++    pub name: String,
++    pub description: String,
++    pub parameters: serde_json::Value,
++}
++
++/// A function call returned by the LLM.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ToolCall {
++    pub id: String,
++    pub name: String,
++    pub arguments: serde_json::Value,
++}
++
++/// A message in the conversation history.
++#[derive(Debug, Clone)]
++pub enum ChatMessage {
++    User(String),
++    Assistant {
++        content: Option<String>,
++        tool_calls: Vec<ToolCall>,
++    },
++    ToolResult {
++        tool_call_id: String,
++        content: String,
++    },
++}
++
++/// Structured response from a provider.
++#[derive(Debug, Clone)]
++pub struct ProviderResponse {
++    pub content: Option<String>,
++    pub tool_calls: Vec<ToolCall>,
++}
++
++impl ProviderResponse {
++    pub fn has_tool_calls(&self) -> bool {
++        !self.tool_calls.is_empty()
++    }
++}
+ 
+ #[async_trait]
+ pub trait Provider: Send + Sync {
+@@ -14,4 +60,33 @@ pub trait Provider: Send + Sync {
+         model: &str,
+         temperature: f64,
+     ) -> anyhow::Result<String>;
++
++    /// Send a multi-turn conversation with optional tool definitions.
++    /// Returns a structured response that may contain tool calls.
++    async fn chat_with_tools(
++        &self,
++        system_prompt: Option<&str>,
++        messages: &[ChatMessage],
++        model: &str,
++        temperature: f64,
++        tools: &[ToolDefinition],
++    ) -> anyhow::Result<ProviderResponse> {
++        // Default: extract the last user message and fall back to chat_with_system.
++        let last_user = messages
++            .iter()
++            .rev()
++            .find_map(|m| match m {
++                ChatMessage::User(content) => Some(content.as_str()),
++                _ => None,
++            })
++            .unwrap_or("");
++        let _ = tools; // unused in fallback
++        let text = self
++            .chat_with_system(system_prompt, last_user, model, temperature)
++            .await?;
++        Ok(ProviderResponse {
++            content: Some(text),
++            tool_calls: vec![],
++        })
++    }
+ }
