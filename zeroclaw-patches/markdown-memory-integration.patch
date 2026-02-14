@@ -1,0 +1,79 @@
+diff --git a/src/memory/mod.rs b/src/memory/mod.rs
+index 1234567..abcdefg 100644
+--- a/src/memory/mod.rs
++++ b/src/memory/mod.rs
+@@ -1,6 +1,8 @@
+ pub mod sqlite;
++pub mod markdown;
++pub mod markdown_tools;
+ pub mod vector;
+
+ pub use sqlite::SqliteMemory;
++pub use markdown::MarkdownMemory;
+
+ use anyhow::Result;
+ use async_trait::async_trait;
+diff --git a/src/agent/loop_.rs b/src/agent/loop_.rs
+index 8d2b0fb..fedcba9 100644
+--- a/src/agent/loop_.rs
++++ b/src/agent/loop_.rs
+@@ -2,6 +2,7 @@
+ use crate::config::Config;
+ use crate::memory::{self, Memory, MemoryCategory};
++use crate::memory::markdown::MarkdownMemory;
++use crate::memory::markdown_tools;
+ use crate::observability::{self, Observer, ObserverEvent};
+ use crate::providers::{self, ChatMessage, Provider, ToolDefinition};
+ use crate::runtime;
+@@ -10,6 +11,7 @@
+ use anyhow::Result;
+ use std::fmt::Write;
+ use std::sync::Arc;
+ use std::time::Instant;
+
+ /// Maximum number of tool-call round-trips before forcing a text response.
+ const MAX_TOOL_ITERATIONS: usize = 25;
+@@ -132,6 +134,17 @@
+ #[allow(clippy::too_many_lines)]
+ pub async fn run(
+     config: Config,
++    // ... existing parameters ...
++) -> Result<()> {
++    // ── Initialize markdown memory ──────────────────────────────
++    let md_memory = Arc::new(MarkdownMemory::new(&config.workspace));
++
++    // Load markdown context (SOUL.md + USER.md + MEMORY.md + daily notes)
++    // and prepend it to the system prompt.
++    let md_context = md_memory.load_session_context().await.unwrap_or_default();
++    let system_prompt = if md_context.is_empty() {
++        system_prompt.to_string()
++    } else {
++        format!("{md_context}\n---\n\n{system_prompt}")
++    };
+
+     // ... existing memory initialization ...
+
+@@ -163,7 +176,11 @@
+     } else {
+         None
+     };
+-    let tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
++    let mut tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
++
++    // Register markdown memory tools (memory_store, memory_recall,
++    // memory_flush, memory_promote)
++    tools.extend(markdown_tools::all_markdown_tools(md_memory.clone()));
+
+     // ── Resolve provider ─────────────────────────────────────────
+     let provider_name = provider_override
+diff --git a/Cargo.toml b/Cargo.toml
+index 1234567..abcdefg 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,6 +15,7 @@
+ anyhow = "1"
+ async-trait = "0.1"
++chrono = "0.4"
+ reqwest = { version = "0.12", features = ["json"] }
+ rusqlite = { version = "0.31", features = ["bundled"] }
+ serde = { version = "1", features = ["derive"] }
