@@ -1,0 +1,244 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index abcdefg..1234567 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,7 @@
+ anyhow = "1"
+ async-trait = "0.1"
+ chrono = "0.4"
++uuid = { version = "1", features = ["v4"] }
+ reqwest = { version = "0.12", features = ["json"] }
+ rusqlite = { version = "0.31", features = ["bundled"] }
+ serde = { version = "1", features = ["derive"] }
+diff --git a/src/memory/mod.rs b/src/memory/mod.rs
+index abcdefg..1234567 100644
+--- a/src/memory/mod.rs
++++ b/src/memory/mod.rs
+@@ -2,6 +2,8 @@
+ pub mod sqlite;
+ pub mod markdown;
+ pub mod markdown_tools;
++pub mod session;
++pub mod session_tools;
+ pub mod vector;
+
+ pub use sqlite::SqliteMemory;
+diff --git a/src/agent/loop_.rs b/src/agent/loop_.rs
+index fedcba9..9876543 100644
+--- a/src/agent/loop_.rs
++++ b/src/agent/loop_.rs
+@@ -3,6 +3,9 @@
+ use crate::config::Config;
+ use crate::memory::{self, Memory, MemoryCategory};
+ use crate::memory::markdown::MarkdownMemory;
+ use crate::memory::markdown_tools;
++use crate::memory::session::{SessionManager, SessionTurn, PersistedToolCall, PersistedToolResult};
++use crate::memory::session_tools;
+ use crate::observability::{self, Observer, ObserverEvent};
+ use crate::providers::{self, ChatMessage, Provider, ToolDefinition};
+ use crate::runtime;
+@@ -11,6 +14,7 @@
+ use anyhow::Result;
+ use std::fmt::Write;
+ use std::sync::Arc;
++use tokio::sync::Mutex;
+ use std::time::Instant;
+
+ /// Maximum number of tool-call round-trips before forcing a text response.
+@@ -63,13 +67,20 @@
+-/// Run the multi-turn agent loop: send messages → parse tool_calls → execute → repeat.
++/// Run the multi-turn agent loop with session persistence.
++///
++/// Every completed turn is written to the session file via `session_mgr`.
++/// The session file is a JSONL file at `~/.zeroclaw/sessions/YYYY-MM-DD_{id}.jsonl`.
+ async fn agent_loop(
+     provider: &dyn Provider,
+     system_prompt: &str,
+     initial_message: &str,
+     model: &str,
+     temperature: f64,
+     tools: &[Box<dyn Tool>],
++    session_mgr: &Arc<Mutex<SessionManager>>,
+ ) -> Result<String> {
+     let tool_defs = tool_definitions(tools);
+     let mut messages = vec![ChatMessage::User(initial_message.to_string())];
+
++    // Persist the user turn
++    {
++        let mgr = session_mgr.lock().await;
++        let user_turn = SessionManager::user_turn(initial_message);
++        mgr.append_turn(&user_turn).await?;
++    }
++
+     for iteration in 0..MAX_TOOL_ITERATIONS {
+         let response = provider
+             .chat_with_tools(Some(system_prompt), &messages, model, temperature, &tool_defs)
+@@ -77,8 +88,17 @@
+         if !response.has_tool_calls() {
+             // Final text response — we're done
++            // Persist the assistant's final text response
++            {
++                let mgr = session_mgr.lock().await;
++                let turn = SessionManager::assistant_turn(
++                    response.content.as_deref(),
++                    vec![],
++                );
++                mgr.append_turn(&turn).await?;
++            }
+             return Ok(response.content.unwrap_or_default());
+         }
+
+         // Log what the LLM wants to do
+         if let Some(text) = &response.content {
+@@ -101,6 +121,16 @@
+         messages.push(ChatMessage::Assistant {
+             content: response.content.clone(),
+             tool_calls: response.tool_calls.clone(),
+         });
+
++        // Persist the assistant turn (with tool calls)
++        {
++            let mgr = session_mgr.lock().await;
++            let persisted_tcs: Vec<PersistedToolCall> = response.tool_calls.iter().map(|tc| {
++                PersistedToolCall {
++                    id: tc.id.clone(),
++                    name: tc.name.clone(),
++                    arguments: tc.arguments.clone(),
++                }
++            }).collect();
++            let turn = SessionManager::assistant_turn(
++                response.content.as_deref(),
++                persisted_tcs,
++            );
++            mgr.append_turn(&turn).await?;
++        }
++
+         // Execute each tool and append results
++        let mut persisted_results: Vec<PersistedToolResult> = Vec::new();
+         for tc in &response.tool_calls {
+             let result = execute_tool(tools, &tc.name, tc.arguments.clone()).await;
+
+@@ -113,8 +143,21 @@
+             messages.push(ChatMessage::ToolResult {
+                 tool_call_id: tc.id.clone(),
+                 content: result,
++                content: result.clone(),
+             });
++
++            persisted_results.push(PersistedToolResult {
++                tool_call_id: tc.id.clone(),
++                content: result,
++            });
++        }
++
++        // Persist tool results as a single turn
++        if !persisted_results.is_empty() {
++            let mgr = session_mgr.lock().await;
++            let turn = SessionManager::tool_result_turn(persisted_results);
++            mgr.append_turn(&turn).await?;
+         }
+     }
+
+@@ -134,6 +177,48 @@
+ pub async fn run(
+     config: Config,
+     // ... existing parameters ...
+ ) -> Result<()> {
++    // ── Initialize session manager ───────────────────────────────
++    let session_mgr = Arc::new(Mutex::new(SessionManager::new(&config.workspace)));
++
++    // Check for a resumable session from today
++    let resumed = {
++        let mut mgr = session_mgr.lock().await;
++        match mgr.find_todays_latest().await? {
++            Some(path) if SessionManager::is_from_today(&path) => {
++                // Ask the user if they want to resume
++                println!(
++                    "Found a session from today. Resume? (y/n)"
++                );
++
++                // Read user input for resume decision
++                let mut input = String::new();
++                std::io::stdin().read_line(&mut input)?;
++
++                if input.trim().eq_ignore_ascii_case("y") {
++                    let turns = mgr.resume_session(&path).await?;
++                    println!("Resumed session with {} turn(s).", turns.len());
++
++                    // Convert persisted turns back to ChatMessage history
++                    let mut history: Vec<ChatMessage> = Vec::new();
++                    for turn in &turns {
++                        match turn.role.as_str() {
++                            "user" => {
++                                if let Some(content) = &turn.content {
++                                    history.push(ChatMessage::User(content.clone()));
++                                }
++                            }
++                            "assistant" => {
++                                let tool_calls = turn.tool_calls.iter().map(|tc| {
++                                    crate::providers::ToolCall {
++                                        id: tc.id.clone(),
++                                        name: tc.name.clone(),
++                                        arguments: tc.arguments.clone(),
++                                    }
++                                }).collect();
++                                history.push(ChatMessage::Assistant {
++                                    content: turn.content.clone(),
++                                    tool_calls,
++                                });
++                            }
++                            "tool_result" => {
++                                for tr in &turn.tool_results {
++                                    history.push(ChatMessage::ToolResult {
++                                        tool_call_id: tr.tool_call_id.clone(),
++                                        content: tr.content.clone(),
++                                    });
++                                }
++                            }
++                            _ => {} // skip unknown roles
++                        }
++                    }
++                    Some(history)
++                } else {
++                    // Start fresh
++                    mgr.new_session().await?;
++                    None
++                }
++            }
++            _ => {
++                // No session from today — start fresh but load memory files
++                mgr.new_session().await?;
++                None
++            }
++        }
++    };
++
+
+     // ── Initialize markdown memory ──────────────────────────────
+     let md_memory = Arc::new(MarkdownMemory::new(&config.workspace));
+
+@@ -176,6 +261,9 @@
+     let mut tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
+
+     // Register markdown memory tools
+     tools.extend(markdown_tools::all_markdown_tools(md_memory.clone()));
++
++    // Register session persistence tools (/new, /sessions)
++    tools.extend(session_tools::all_session_tools(session_mgr.clone()));
+
+     // ── Resolve provider ─────────────────────────────────────────
+@@ -226,6 +314,7 @@
+             model_name,
+             temperature,
+             &tools,
++            &session_mgr,
+         )
+         .await?;
+
+@@ -278,6 +367,7 @@
+                 model_name,
+                 temperature,
+                 &tools,
++                &session_mgr,
+             )
+             .await?;
