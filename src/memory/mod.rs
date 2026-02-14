@@ -1,4 +1,4 @@
-//! Markdown-based memory and session persistence for ZeroClaw.
+//! Markdown-based memory, session persistence, and context management for ZeroClaw.
 //!
 //! This module provides a plain-file alternative to the SQLite memory backend.
 //! It uses human-readable markdown files for all memory storage, making it
@@ -6,6 +6,10 @@
 //!
 //! It also provides session persistence so conversations survive process
 //! restarts, writing each turn as JSONL to `~/.zeroclaw/sessions/`.
+//!
+//! Context window management prevents overflow by tracking token usage,
+//! pruning old tool results, and auto-compacting conversations when they
+//! approach the provider's context limit.
 //!
 //! ## File Layout
 //!
@@ -29,6 +33,7 @@
 //! use crate::memory::markdown_tools;
 //! use crate::memory::session::SessionManager;
 //! use crate::memory::session_tools;
+//! use crate::memory::context::{ContextManager, ContextConfig};
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;
 //!
@@ -38,11 +43,16 @@
 //! // Load context for system prompt injection
 //! let context = md_mem.load_session_context().await?;
 //!
+//! // Set up context window management
+//! let mut ctx_mgr = ContextManager::for_provider("anthropic");
+//! ctx_mgr.set_system_prompt_tokens(context.len() / 4);
+//!
 //! // Register tools in the agent loop
 //! let mut tools = markdown_tools::all_markdown_tools(md_mem);
 //! tools.extend(session_tools::all_session_tools(session_mgr));
 //! ```
 
+pub mod context;
 pub mod markdown;
 pub mod markdown_tools;
 pub mod session;
