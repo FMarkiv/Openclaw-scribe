@@ -75,9 +75,14 @@ impl MarkdownMemory {
         self.daily_note_path(Local::now().date_naive())
     }
 
-    fn yesterday_note_path(&self) -> PathBuf {
+    pub fn yesterday_note_path(&self) -> PathBuf {
         let yesterday = Local::now().date_naive() - chrono::Duration::days(1);
         self.daily_note_path(yesterday)
+    }
+
+    /// The base directory for all markdown memory files.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
     }
 
     // ── Session start: build system prompt context ───────────────
