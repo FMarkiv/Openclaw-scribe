@@ -137,6 +137,7 @@
 
 pub mod agent;
 pub mod agent_tools;
+pub mod composio;
 pub mod context;
 pub mod failover;
 pub mod file_tools;
