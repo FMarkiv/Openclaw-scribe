@@ -135,6 +135,8 @@
 //! // Process tg_rx messages through the same agent loop
 //! ```
 
+pub mod agent;
+pub mod agent_tools;
 pub mod context;
 pub mod failover;
 pub mod file_tools;
