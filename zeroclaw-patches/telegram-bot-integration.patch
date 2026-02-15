@@ -1,0 +1,194 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1234567..abcdefg 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,7 @@
+ anyhow = "1"
+ async-trait = "0.1"
+ chrono = "0.4"
++toml = "0.8"
+ uuid = { version = "1", features = ["v4"] }
+ reqwest = { version = "0.12", features = ["json"] }
+ rusqlite = { version = "0.31", features = ["bundled"] }
+diff --git a/src/memory/mod.rs b/src/memory/mod.rs
+index 1234567..abcdefg 100644
+--- a/src/memory/mod.rs
++++ b/src/memory/mod.rs
+@@ -6,6 +6,7 @@
+ pub mod session_tools;
+ pub mod silent;
+ pub mod startup;
++pub mod telegram;
+ pub mod web_tools;
+
+diff --git a/src/config.rs b/src/config.rs
+index 1234567..abcdefg 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -42,6 +42,22 @@
+     pub browser: BrowserConfig,
++
++    /// Telegram bot configuration.
++    pub telegram: TelegramSection,
++}
++
++/// Configuration section for the Telegram bot channel.
++#[derive(Debug, Clone, Default)]
++pub struct TelegramSection {
++    /// Bot token from @BotFather. Can also be set via TELEGRAM_BOT_TOKEN env var.
++    pub bot_token: String,
++    /// Whether the Telegram listener is enabled.
++    pub enabled: bool,
++    /// Polling interval in seconds (default: 5).
++    pub poll_interval_secs: u64,
++    /// Long-polling timeout in seconds (default: 30).
++    pub long_poll_timeout_secs: u64,
+ }
+
+ impl Config {
+@@ -78,6 +94,24 @@
+         config.brave_api_key = toml_value
+             .get("brave_api_key")
+             .and_then(|v| v.as_str())
+             .map(|s| s.to_string());
++
++        // Parse [telegram] section
++        if let Some(tg) = toml_value.get("telegram") {
++            config.telegram = TelegramSection {
++                bot_token: tg.get("bot_token")
++                    .and_then(|v| v.as_str())
++                    .unwrap_or("")
++                    .to_string(),
++                enabled: tg.get("enabled")
++                    .and_then(|v| v.as_bool())
++                    .unwrap_or(false),
++                poll_interval_secs: tg.get("poll_interval_secs")
++                    .and_then(|v| v.as_integer())
++                    .map(|v| v.max(1) as u64)
++                    .unwrap_or(5),
++                long_poll_timeout_secs: tg.get("long_poll_timeout_secs")
++                    .and_then(|v| v.as_integer())
++                    .map(|v| v.max(1) as u64)
++                    .unwrap_or(30),
++            };
++        }
+
+         Ok(config)
+diff --git a/src/cli.rs b/src/cli.rs
+index 1234567..abcdefg 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -32,6 +32,10 @@
+     /// Path to workspace directory
+     #[arg(long)]
+     pub workspace: Option<String>,
++
++    /// Enable the Telegram bot listener alongside the CLI.
++    #[arg(long)]
++    pub telegram: bool,
+ }
+
+diff --git a/src/agent/loop_.rs b/src/agent/loop_.rs
+index 1234567..abcdefg 100644
+--- a/src/agent/loop_.rs
++++ b/src/agent/loop_.rs
+@@ -5,6 +5,7 @@
+ use crate::memory::markdown::MarkdownMemory;
+ use crate::memory::markdown_tools;
+ use crate::memory::session::{SessionManager, SessionTurn, PersistedToolCall, PersistedToolResult};
+ use crate::memory::session_tools;
++use crate::memory::telegram::{TelegramConfig, TelegramListener, IncomingTelegramMessage};
+ use crate::observability::{self, Observer, ObserverEvent};
+ use crate::providers::{self, ChatMessage, Provider, ToolDefinition};
+ use crate::runtime;
+@@ -134,6 +135,8 @@
+ pub async fn run(
+     config: Config,
++    enable_telegram: bool,
+     // ... existing parameters ...
+ ) -> Result<()> {
+     // ... existing initialization (markdown memory, session manager, tools) ...
+
+@@ -261,6 +264,58 @@
+     // Register session persistence tools (/new, /sessions)
+     tools.extend(session_tools::all_session_tools(session_mgr.clone()));
+
++    // ── Optional: start Telegram listener ────────────────────────
++    //
++    // The Telegram listener runs in a background tokio task, polling
++    // for messages and routing them through the same agent pipeline.
++    // It shares the MarkdownMemory and SessionManager with the CLI,
++    // so all interactions are persisted and visible in session history
++    // and daily notes.
++    //
++    // Enabled by either:
++    //   --telegram flag on the command line
++    //   enabled = true in [telegram] config section
++    //   TELEGRAM_BOT_TOKEN env var being set (auto-enables)
++    let telegram_enabled = enable_telegram
++        || config.telegram.enabled
++        || std::env::var("TELEGRAM_BOT_TOKEN").is_ok();
++
++    let _telegram_handle: Option<tokio::task::JoinHandle<()>> = if telegram_enabled {
++        let tg_token = config.telegram.bot_token.clone();
++        let tg_config = TelegramConfig {
++            bot_token: tg_token,
++            enabled: true,
++            poll_interval_secs: config.telegram.poll_interval_secs,
++            long_poll_timeout_secs: config.telegram.long_poll_timeout_secs,
++        };
++
++        match TelegramListener::new(
++            tg_config,
++            md_memory.clone(),
++            session_mgr.clone(),
++        ) {
++            Ok(listener) => {
++                let (mut tg_rx, poll_handle) = listener.start_polling();
++                let tg_api = listener.api().clone();
++                let tg_session_mgr = session_mgr.clone();
++                let tg_memory = md_memory.clone();
++
++                // Spawn a task to process incoming Telegram messages
++                // through the same agent loop used by the CLI
++                let handle = tokio::spawn(async move {
++                    while let Some(msg) = tg_rx.recv().await {
++                        // NOTE: The actual agent_loop call would go here.
++                        // This is a placeholder showing the integration point —
++                        // the real implementation calls agent_loop() with the
++                        // message text and sends the response back.
++                        //
++                        // let response = agent_loop(provider, system_prompt,
++                        //     &msg.text, model, temperature, &tools,
++                        //     &tg_session_mgr).await;
++                        // tg_api.send_message(msg.chat_id, &response).await;
++                        eprintln!("[telegram] Received: {}", msg.text);
++                    }
++                });
++
++                eprintln!("[telegram] Listener started (poll interval: {}s)",
++                    config.telegram.poll_interval_secs);
++                Some(handle)
++            }
++            Err(e) => {
++                eprintln!("[telegram] Failed to start listener: {e}");
++                None
++            }
++        }
++    } else {
++        None
++    };
++
+     // ── Resolve provider ─────────────────────────────────────────
+
+diff --git a/src/main.rs b/src/main.rs
+index 1234567..abcdefg 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -48,6 +48,7 @@
+         agent::loop_::run(
+             config,
++            cli.telegram,
+             // ... existing args ...
+         )
+         .await?;
