@@ -6,9 +6,30 @@
 
 # ── Provider ─────────────────────────────────────────────────────
 [provider]
-# name = "anthropic"     # anthropic | openai | ollama | openrouter | compatible
+# primary = "anthropic"  # anthropic | openai | ollama | openrouter | compatible
 # api_key = "sk-..."     # Or set ANTHROPIC_API_KEY / OPENAI_API_KEY env var
 # model = "claude-sonnet-4-20250514"
+
+# ── Fallback Providers ──────────────────────────────────────────
+#
+# Optional ordered list of fallback providers. When the primary
+# provider fails with a retryable error (429, 500, 502, 503, 529,
+# or connection timeout), ZeroClaw automatically tries the next
+# fallback in sequence. On the next user turn, the primary is
+# always tried first again.
+#
+# Auth errors (401, 403) skip the provider. Context overflow errors
+# trigger compaction instead of failover.
+#
+# Use /provider to check the current provider status and chain.
+#
+# [[provider.fallbacks]]
+# provider = "openai"
+# model = "gpt-4o"
+#
+# [[provider.fallbacks]]
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4-20250514"
 
 # ── Workspace ────────────────────────────────────────────────────
 [workspace]
