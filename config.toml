@@ -65,6 +65,25 @@ poll_interval_secs = 5
 # the number of HTTP requests. Default: 30 seconds.
 long_poll_timeout_secs = 30
 
+# ── Sandbox ─────────────────────────────────────────────────────
+#
+# Optional Docker sandboxing for shell command execution. When
+# enabled, shell commands run inside an ephemeral Docker container
+# instead of directly on the host — useful for untrusted inputs
+# (e.g. Telegram users).
+#
+# Requires Docker to be installed. When disabled (the default),
+# shell commands run directly on the host with zero overhead.
+#
+# [sandbox]
+# enabled = false                    # opt-in, default off
+# image = "zeroclaw-sandbox:latest"  # Docker image to use
+# workspace = "/workspace"           # mount point inside container
+# timeout_seconds = 30               # per-command timeout
+# memory_limit = "256m"              # container memory cap
+# network = false                    # disable network in sandbox
+# mount_paths = []                   # additional read-only mounts
+
 # ── Security ─────────────────────────────────────────────────────
 # [security]
 # shell_allowlist = ["git", "cargo", "npm", "ls", "cat", "grep"]
