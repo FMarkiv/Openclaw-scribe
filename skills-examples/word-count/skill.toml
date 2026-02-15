@@ -1,0 +1,22 @@
+name = "word-count"
+description = "Count words, lines, and characters in a file or directory"
+version = "1.0"
+enabled = true
+
+[execution]
+runner = "shell"
+script = "run.sh"
+timeout_seconds = 10
+working_dir = "workspace"
+
+[[parameters]]
+name = "path"
+type = "string"
+description = "File or directory path to count"
+required = true
+
+[[parameters]]
+name = "recursive"
+type = "boolean"
+description = "If true and path is a directory, count recursively"
+required = false

@@ -1,0 +1,22 @@
+name = "git-commit"
+description = "Stage and commit changes with an AI-generated message"
+version = "1.0"
+enabled = true
+
+[execution]
+runner = "shell"
+script = "run.sh"
+timeout_seconds = 30
+working_dir = "workspace"
+
+[[parameters]]
+name = "message"
+type = "string"
+description = "Commit message (optional — AI generates if omitted)"
+required = false
+
+[[parameters]]
+name = "files"
+type = "string"
+description = "Space-separated file paths to stage"
+required = true

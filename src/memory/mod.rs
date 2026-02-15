@@ -148,6 +148,8 @@ pub mod sandbox;
 pub mod session;
 pub mod session_tools;
 pub mod silent;
+pub mod skills;
+pub mod skills_tools;
 pub mod startup;
 pub mod subagent;
 pub mod telegram;
