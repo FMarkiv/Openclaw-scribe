@@ -54,7 +54,6 @@
 //! `--telegram` on the command line.
 
 use anyhow::{Context, Result};
-use chrono::Local;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

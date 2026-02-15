@@ -28,7 +28,7 @@
 
 use crate::memory::markdown::MarkdownMemory;
 use crate::memory::silent;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Local;
@@ -36,13 +36,6 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-
-/// Result type returned by tool execution (matches other tool modules).
-pub struct ToolExecutionResult {
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-}
 
 // ── HeartbeatManager ─────────────────────────────────────────────
 

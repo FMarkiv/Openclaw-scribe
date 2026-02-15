@@ -15,20 +15,13 @@
 //!
 //! Get a key at <https://brave.com/search/api/>.
 
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
-
-/// Result type returned by tool execution (matches other tool modules).
-pub struct ToolExecutionResult {
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-}
 
 /// Approximate token count by splitting on whitespace.
 ///
