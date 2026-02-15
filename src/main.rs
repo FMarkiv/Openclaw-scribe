@@ -9,6 +9,7 @@ use openclaw_scribe::memory::session::SessionManager;
 use openclaw_scribe::memory::context::ContextManager;
 use openclaw_scribe::memory::heartbeat::HeartbeatManager;
 use openclaw_scribe::memory::startup::StartupManager;
+use openclaw_scribe::memory::subagent::{SubagentManager, spawn_heartbeat_subagent};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -30,8 +31,13 @@ async fn main() -> anyhow::Result<()> {
     let mut ctx_mgr = ContextManager::for_provider("anthropic");
     ctx_mgr.set_system_prompt_tokens(context.len() / 4);
 
+    // Set up subagent manager for background task execution
+    let notify: openclaw_scribe::memory::subagent::NotifyCallback =
+        Arc::new(|msg| eprintln!("{msg}"));
+    let subagent_mgr = Arc::new(SubagentManager::new(md_mem.clone(), notify));
+
     // Set up heartbeat and startup managers
-    let heartbeat_mgr = Arc::new(HeartbeatManager::new(md_mem.clone()));
+    let _heartbeat_mgr = Arc::new(HeartbeatManager::new(md_mem.clone()));
     let startup_mgr = StartupManager::new(md_mem.clone());
 
     // Check for morning summary on startup
@@ -39,9 +45,18 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[zeroclaw] Morning summary prompt ready");
     }
 
-    // Check for heartbeat tasks
-    if let Some(_prompt) = heartbeat_mgr.run_cycle().await? {
-        eprintln!("[zeroclaw] Heartbeat tasks ready");
+    // Spawn heartbeat as a background subagent (non-blocking)
+    match spawn_heartbeat_subagent(&subagent_mgr, &md_mem, Vec::new()).await {
+        Ok(Some(_handle)) => {
+            // Heartbeat is running in background — don't block on it
+            eprintln!("[zeroclaw] Heartbeat spawned as background subagent");
+        }
+        Ok(None) => {
+            eprintln!("[zeroclaw] No heartbeat tasks found");
+        }
+        Err(e) => {
+            eprintln!("[zeroclaw] Heartbeat spawn error: {e}");
+        }
     }
 
     // Start or resume session
