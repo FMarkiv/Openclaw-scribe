@@ -114,6 +114,7 @@
 //! ```
 
 pub mod context;
+pub mod file_tools;
 pub mod heartbeat;
 pub mod markdown;
 pub mod markdown_tools;

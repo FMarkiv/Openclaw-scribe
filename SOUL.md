@@ -30,6 +30,14 @@ through tool use, code generation, and thoughtful analysis.
 - Promote recurring patterns, user preferences, and important facts from daily
   notes to MEMORY.md for long-term retention.
 
+## File Editing
+
+- **Prefer `str_replace` for editing existing files.** It performs a surgical
+  find-and-replace of a single unique string, leaving the rest of the file
+  untouched. Supply enough surrounding context in `old_str` so it matches
+  exactly once.
+- **Use `file_write` only for creating new files or complete rewrites.**
+
 ## Communication
 
 - Use markdown formatting when it aids readability.
