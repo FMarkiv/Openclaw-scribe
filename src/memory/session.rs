@@ -1,20 +1,21 @@
 //! Session persistence for ZeroClaw.
 //!
 //! Writes every completed conversation turn to a JSONL file so that
-//! sessions survive process restarts. Each session file lives at:
+//! sessions survive process restarts. Each named session lives at:
 //!
 //! ```text
-//! ~/.zeroclaw/sessions/YYYY-MM-DD_{session_id}.jsonl
+//! ~/.zeroclaw/sessions/<name>/session.jsonl
 //! ```
 //!
 //! Each line is a self-contained JSON object with:
 //! `role`, `content`, `tool_calls`, `tool_results`, `timestamp`
 //!
-//! On startup the most recent session from today can be resumed,
-//! restoring full message history into the agent loop.
+//! On startup the most recently active session (across all names) is
+//! resumed. Named sessions can be created, switched, renamed, and
+//! listed via local commands.
 
-use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate};
+use anyhow::{bail, Context, Result};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -58,36 +59,95 @@ pub struct SessionTurn {
     pub timestamp: String,
 }
 
-/// Metadata about a session file, used by the `/sessions` listing.
+/// Metadata about a named session, used by `/sessions` listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// The session name (slug).
+    pub name: String,
+    /// ISO-8601 timestamp of when the session was created.
+    pub created_at: String,
+    /// ISO-8601 timestamp of the most recent activity.
+    pub last_active: String,
+    /// Optional provider name (e.g. "anthropic").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional model name (e.g. "claude-3-opus").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Information about a session for listing purposes.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
-    /// The session ID (UUID portion of the filename).
-    pub session_id: String,
-    /// Date the session was created.
-    pub date: NaiveDate,
-    /// Number of turns (lines) in the file.
+    /// The session name (slug).
+    pub name: String,
+    /// ISO-8601 timestamp of last activity.
+    pub last_active: String,
+    /// Number of turns (lines) in the session file.
     pub turn_count: usize,
-    /// Full path to the session file.
+    /// Full path to the session directory.
     pub path: PathBuf,
+}
+
+// ── Slug helper ──────────────────────────────────────────────────
+
+/// Slugify a session name: lowercase, replace non-alphanumeric with
+/// hyphens, collapse multiple hyphens, trim leading/trailing hyphens.
+pub fn slugify(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse multiple hyphens and trim
+    let mut result = String::new();
+    let mut prev_hyphen = true; // treat start as hyphen to trim leading
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim trailing hyphen
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    if result.is_empty() {
+        // Fallback for purely non-alphanumeric input
+        "unnamed".to_string()
+    } else {
+        result
+    }
 }
 
 // ── SessionManager ───────────────────────────────────────────────
 
 /// Manages reading and writing session JSONL files.
 ///
-/// Each session gets a unique file:
-/// `{sessions_dir}/YYYY-MM-DD_{session_id}.jsonl`
+/// Named sessions use the directory layout:
+/// `{sessions_dir}/<name>/session.jsonl`
+/// `{sessions_dir}/<name>/session.json`  (metadata)
 ///
 /// The manager can:
-/// - Create new sessions
+/// - Create new named sessions
+/// - Switch between sessions
 /// - Append turns to the current session
-/// - Find and load the most recent session for today
-/// - List recent sessions with metadata
+/// - Find and resume the most recently active session
+/// - List all sessions with metadata
+/// - Rename sessions
 pub struct SessionManager {
-    /// Directory where session files are stored (typically ~/.zeroclaw/sessions/).
+    /// Directory where session directories are stored (typically ~/.zeroclaw/sessions/).
     sessions_dir: PathBuf,
-    /// Current session ID (set on new_session or resume).
-    session_id: Option<String>,
+    /// Current session name (set on new_session or resume).
+    session_name: Option<String>,
     /// Current session file path.
     session_path: Option<PathBuf>,
 }
@@ -100,24 +160,44 @@ impl SessionManager {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             sessions_dir: base_dir.into().join("sessions"),
-            session_id: None,
+            session_name: None,
             session_path: None,
         }
     }
 
-    /// The directory where all session files live.
+    /// The directory where all session directories live.
     pub fn sessions_dir(&self) -> &Path {
         &self.sessions_dir
     }
 
-    /// The current session ID, if any.
+    /// The current session name, if any.
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_name.as_deref()
+    }
+
+    /// The current session ID (returns session name for compatibility).
     pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+        self.session_name.as_deref()
     }
 
     /// The current session file path, if any.
     pub fn session_path(&self) -> Option<&Path> {
         self.session_path.as_deref()
+    }
+
+    /// The directory for a given session name.
+    pub fn session_dir_for(&self, name: &str) -> PathBuf {
+        self.sessions_dir.join(name)
+    }
+
+    /// The JSONL file path for a given session name.
+    fn session_jsonl_for(&self, name: &str) -> PathBuf {
+        self.sessions_dir.join(name).join("session.jsonl")
+    }
+
+    /// The metadata file path for a given session name.
+    fn session_meta_path_for(&self, name: &str) -> PathBuf {
+        self.sessions_dir.join(name).join("session.json")
     }
 
     // ── Directory setup ──────────────────────────────────────────
@@ -139,44 +219,174 @@ impl SessionManager {
 
     // ── Session lifecycle ────────────────────────────────────────
 
-    /// Start a brand-new session. Generates a new UUID and creates the file.
-    pub async fn new_session(&mut self) -> Result<String> {
+    /// Start a brand-new named session.
+    ///
+    /// Creates the session directory, empty JSONL file, and metadata.
+    /// Returns an error if a session with that name already exists.
+    pub async fn new_named_session(&mut self, name: &str) -> Result<String> {
+        let slug = slugify(name);
         self.ensure_sessions_dir().await?;
 
-        let id = Uuid::new_v4().to_string()[..8].to_string(); // short ID
-        let date = Local::now().date_naive().format("%Y-%m-%d");
-        let filename = format!("{date}_{id}.jsonl");
-        let path = self.sessions_dir.join(&filename);
+        let dir = self.session_dir_for(&slug);
+        if dir.exists() {
+            bail!("Session '{}' already exists", slug);
+        }
 
-        // Touch the file so it exists
+        fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("Failed to create session dir: {}", dir.display()))?;
+
+        let jsonl_path = self.session_jsonl_for(&slug);
         fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&path)
+            .open(&jsonl_path)
             .await
-            .with_context(|| format!("Failed to create session file: {}", path.display()))?;
+            .with_context(|| format!("Failed to create session file: {}", jsonl_path.display()))?;
 
-        self.session_id = Some(id.clone());
-        self.session_path = Some(path);
+        let now = Local::now().to_rfc3339();
+        let meta = SessionMeta {
+            name: slug.clone(),
+            created_at: now.clone(),
+            last_active: now,
+            provider: None,
+            model: None,
+        };
+        self.write_meta(&slug, &meta).await?;
 
-        Ok(id)
+        self.session_name = Some(slug.clone());
+        self.session_path = Some(jsonl_path);
+
+        Ok(slug)
     }
 
-    /// Resume an existing session by loading its turns.
+    /// Start a brand-new session with an auto-generated ID (backwards compat).
+    ///
+    /// Uses UUID-based naming: creates session under "default" name if
+    /// no name is given, or generates a unique fallback.
+    pub async fn new_session(&mut self) -> Result<String> {
+        self.ensure_sessions_dir().await?;
+
+        // If "default" doesn't exist, create it; otherwise generate a unique name
+        let name = if !self.session_dir_for("default").exists() {
+            "default".to_string()
+        } else {
+            let id = Uuid::new_v4().to_string()[..8].to_string();
+            format!("session-{id}")
+        };
+
+        match self.new_named_session(&name).await {
+            Ok(slug) => Ok(slug),
+            Err(_) => {
+                // Name collision, try with a uuid suffix
+                let id = Uuid::new_v4().to_string()[..8].to_string();
+                let fallback = format!("session-{id}");
+                self.new_named_session(&fallback).await
+            }
+        }
+    }
+
+    /// Resume an existing session by name.
     ///
     /// Sets this session as the active one and returns all persisted turns.
+    pub async fn resume_named_session(&mut self, name: &str) -> Result<Vec<SessionTurn>> {
+        let slug = slugify(name);
+        let dir = self.session_dir_for(&slug);
+        if !dir.exists() {
+            bail!("Session '{}' does not exist", slug);
+        }
+
+        let jsonl_path = self.session_jsonl_for(&slug);
+        let turns = self.load_turns(&jsonl_path).await?;
+
+        // Update last_active
+        self.touch_meta(&slug).await?;
+
+        self.session_name = Some(slug);
+        self.session_path = Some(jsonl_path);
+
+        Ok(turns)
+    }
+
+    /// Resume an existing session from a file path (backwards compat).
+    ///
+    /// Handles both new-style directory sessions and old-style flat JSONL files.
     pub async fn resume_session(&mut self, path: &Path) -> Result<Vec<SessionTurn>> {
+        // Check if this is a new-style directory session
+        if path.file_name().and_then(|f| f.to_str()) == Some("session.jsonl") {
+            if let Some(parent) = path.parent() {
+                if let Some(name) = parent.file_name().and_then(|f| f.to_str()) {
+                    return self.resume_named_session(name).await;
+                }
+            }
+        }
+
+        // Old-style flat file: extract name from filename
         let filename = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
         let id = extract_session_id(filename);
+        let turns = self.load_turns(path).await?;
 
-        self.session_id = Some(id.to_string());
+        self.session_name = Some(id.to_string());
         self.session_path = Some(path.to_path_buf());
 
-        self.load_turns(path).await
+        Ok(turns)
+    }
+
+    /// Switch to a different named session. Saves the current session
+    /// (flushes pending JSONL) before loading the new one.
+    ///
+    /// Returns the loaded turns from the target session.
+    pub async fn switch_session(&mut self, name: &str) -> Result<Vec<SessionTurn>> {
+        let slug = slugify(name);
+
+        // Touch current session's last_active before leaving
+        if let Some(current) = &self.session_name {
+            let _ = self.touch_meta(current).await;
+        }
+
+        self.resume_named_session(&slug).await
+    }
+
+    /// Rename the current session.
+    pub async fn rename_session(&mut self, new_name: &str) -> Result<String> {
+        let new_slug = slugify(new_name);
+
+        let current_name = self
+            .session_name
+            .as_ref()
+            .context("No active session to rename")?
+            .clone();
+
+        if current_name == new_slug {
+            return Ok(new_slug);
+        }
+
+        let old_dir = self.session_dir_for(&current_name);
+        let new_dir = self.session_dir_for(&new_slug);
+
+        if new_dir.exists() {
+            bail!("Session '{}' already exists", new_slug);
+        }
+
+        fs::rename(&old_dir, &new_dir)
+            .await
+            .with_context(|| format!("Failed to rename session directory"))?;
+
+        // Update metadata
+        if let Ok(mut meta) = self.read_meta(&new_slug).await {
+            meta.name = new_slug.clone();
+            let _ = self.write_meta(&new_slug, &meta).await;
+        }
+
+        let new_jsonl = self.session_jsonl_for(&new_slug);
+        self.session_name = Some(new_slug.clone());
+        self.session_path = Some(new_jsonl);
+
+        Ok(new_slug)
     }
 
     /// Append a completed turn to the current session file.
@@ -203,6 +413,11 @@ impl SessionManager {
         file.write_all(line.as_bytes())
             .await
             .with_context(|| format!("Failed to write to session file: {}", path.display()))?;
+
+        // Update last_active timestamp
+        if let Some(name) = &self.session_name {
+            let _ = self.touch_meta(name).await;
+        }
 
         Ok(())
     }
@@ -247,15 +462,30 @@ impl SessionManager {
 
     // ── Session discovery ────────────────────────────────────────
 
+    /// Find the most recently active session across all names.
+    ///
+    /// Returns `None` if there are no sessions.
+    pub async fn find_most_recent(&self) -> Result<Option<PathBuf>> {
+        let sessions = self.list_sessions(1).await?;
+        Ok(sessions.into_iter().next().map(|info| {
+            self.session_jsonl_for(&info.name)
+        }))
+    }
+
     /// Find the most recent session file from today, if one exists.
     ///
-    /// Returns `None` if there are no sessions from today.
+    /// Now checks named sessions and also falls back to legacy flat files.
     pub async fn find_todays_latest(&self) -> Result<Option<PathBuf>> {
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let sessions = self.list_session_files().await?;
+        // First try: find the most recently active named session
+        if let Some(path) = self.find_most_recent().await? {
+            return Ok(Some(path));
+        }
 
-        // Files are named YYYY-MM-DD_{id}.jsonl — filter to today, pick latest by mtime
-        let mut todays: Vec<PathBuf> = sessions
+        // Fallback: check for legacy flat JSONL files
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let legacy_files = self.list_legacy_session_files().await?;
+
+        let mut todays: Vec<PathBuf> = legacy_files
             .into_iter()
             .filter(|p| {
                 p.file_name()
@@ -269,7 +499,6 @@ impl SessionManager {
             return Ok(None);
         }
 
-        // Sort by modification time (most recent last)
         todays.sort_by_key(|p| {
             std::fs::metadata(p)
                 .and_then(|m| m.modified())
@@ -279,40 +508,139 @@ impl SessionManager {
         Ok(todays.last().cloned())
     }
 
-    /// List recent sessions with metadata (for the `/sessions` command).
+    /// List all sessions with metadata, most recently active first.
     ///
-    /// Returns up to `limit` sessions, most recent first.
+    /// Returns up to `limit` sessions.
     pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionInfo>> {
-        let mut files = self.list_session_files().await?;
-
-        // Sort by modification time, most recent first
-        files.sort_by_key(|p| {
-            std::cmp::Reverse(
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-            )
-        });
-
-        files.truncate(limit);
+        if !self.sessions_dir.exists() {
+            return Ok(Vec::new());
+        }
 
         let mut infos = Vec::new();
-        for path in files {
-            if let Some(info) = self.session_info(&path).await? {
-                infos.push(info);
+
+        let mut entries = fs::read_dir(&self.sessions_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to read sessions dir: {}",
+                    self.sessions_dir.display()
+                )
+            })?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
             }
+
+            let name = match path.file_name().and_then(|f| f.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            let jsonl_path = path.join("session.jsonl");
+            if !jsonl_path.exists() {
+                continue;
+            }
+
+            // Read metadata
+            let (last_active, turn_count) = match self.read_meta(&name).await {
+                Ok(meta) => {
+                    let content = fs::read_to_string(&jsonl_path).await.unwrap_or_default();
+                    let tc = content.lines().filter(|l| !l.trim().is_empty()).count();
+                    (meta.last_active, tc)
+                }
+                Err(_) => {
+                    // No metadata file — use file mtime
+                    let mtime = std::fs::metadata(&jsonl_path)
+                        .and_then(|m| m.modified())
+                        .ok();
+                    let content = fs::read_to_string(&jsonl_path).await.unwrap_or_default();
+                    let tc = content.lines().filter(|l| !l.trim().is_empty()).count();
+                    let last = mtime
+                        .map(|t| {
+                            let dt: chrono::DateTime<Local> = t.into();
+                            dt.to_rfc3339()
+                        })
+                        .unwrap_or_else(|| Local::now().to_rfc3339());
+                    (last, tc)
+                }
+            };
+
+            infos.push(SessionInfo {
+                name,
+                last_active,
+                turn_count,
+                path,
+            });
         }
+
+        // Sort by last_active descending
+        infos.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        infos.truncate(limit);
 
         Ok(infos)
     }
 
-    /// Check whether a session file is from today.
+    /// Check whether a session with the given name exists.
+    pub fn session_exists(&self, name: &str) -> bool {
+        let slug = slugify(name);
+        self.session_dir_for(&slug).exists()
+    }
+
+    /// Check whether a session file is from today (legacy compat).
     pub fn is_from_today(path: &Path) -> bool {
         let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
         path.file_name()
             .and_then(|f| f.to_str())
             .map(|f| f.starts_with(&today))
             .unwrap_or(false)
+    }
+
+    // ── Metadata helpers ─────────────────────────────────────────
+
+    /// Write session metadata to disk.
+    async fn write_meta(&self, name: &str, meta: &SessionMeta) -> Result<()> {
+        let path = self.session_meta_path_for(name);
+        let json = serde_json::to_string_pretty(meta)
+            .context("Failed to serialize session metadata")?;
+        fs::write(&path, json)
+            .await
+            .with_context(|| format!("Failed to write metadata: {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Read session metadata from disk.
+    async fn read_meta(&self, name: &str) -> Result<SessionMeta> {
+        let path = self.session_meta_path_for(name);
+        let content = fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to read metadata: {}", path.display()))?;
+        let meta: SessionMeta = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse metadata: {}", path.display()))?;
+        Ok(meta)
+    }
+
+    /// Update the last_active timestamp in metadata.
+    async fn touch_meta(&self, name: &str) -> Result<()> {
+        match self.read_meta(name).await {
+            Ok(mut meta) => {
+                meta.last_active = Local::now().to_rfc3339();
+                self.write_meta(name, &meta).await
+            }
+            Err(_) => {
+                // Create metadata if it doesn't exist
+                let now = Local::now().to_rfc3339();
+                let meta = SessionMeta {
+                    name: name.to_string(),
+                    created_at: now.clone(),
+                    last_active: now,
+                    provider: None,
+                    model: None,
+                };
+                self.write_meta(name, &meta).await
+            }
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────
@@ -342,8 +670,8 @@ impl SessionManager {
         Ok(turns)
     }
 
-    /// List all .jsonl files in the sessions directory.
-    async fn list_session_files(&self) -> Result<Vec<PathBuf>> {
+    /// List legacy flat .jsonl files in the sessions directory.
+    async fn list_legacy_session_files(&self) -> Result<Vec<PathBuf>> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -360,45 +688,12 @@ impl SessionManager {
         let mut files = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                 files.push(path);
             }
         }
 
         Ok(files)
-    }
-
-    /// Build SessionInfo metadata for a single session file.
-    async fn session_info(&self, path: &Path) -> Result<Option<SessionInfo>> {
-        let filename = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(f) => f,
-            None => return Ok(None),
-        };
-
-        // Parse date from YYYY-MM-DD_{id}
-        let date = if filename.len() >= 10 {
-            NaiveDate::parse_from_str(&filename[..10], "%Y-%m-%d").ok()
-        } else {
-            None
-        };
-
-        let date = match date {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        let session_id = extract_session_id(filename).to_string();
-
-        // Count lines (turns) in the file
-        let content = fs::read_to_string(path).await.unwrap_or_default();
-        let turn_count = content.lines().filter(|l| !l.trim().is_empty()).count();
-
-        Ok(Some(SessionInfo {
-            session_id,
-            date,
-            turn_count,
-            path: path.to_path_buf(),
-        }))
     }
 }
 
@@ -431,9 +726,9 @@ mod tests {
     #[tokio::test]
     async fn new_session_creates_file() {
         let (_tmp, mut mgr) = setup().await;
-        let id = mgr.new_session().await.unwrap();
+        let name = mgr.new_session().await.unwrap();
 
-        assert!(!id.is_empty());
+        assert!(!name.is_empty());
         assert!(mgr.session_path().unwrap().exists());
         assert!(mgr
             .session_path()
@@ -444,9 +739,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_named_session_creates_directory() {
+        let (_tmp, mut mgr) = setup().await;
+        let name = mgr.new_named_session("my-project").await.unwrap();
+
+        assert_eq!(name, "my-project");
+        assert!(mgr.session_path().unwrap().exists());
+        assert!(mgr.session_dir_for("my-project").exists());
+
+        // Check metadata exists
+        let meta_path = mgr.session_meta_path_for("my-project");
+        assert!(meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_errors() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("test").await.unwrap();
+        let result = mgr.new_named_session("test").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
     async fn append_and_load_turns() {
         let (_tmp, mut mgr) = setup().await;
-        mgr.new_session().await.unwrap();
+        mgr.new_named_session("test").await.unwrap();
 
         // Write a user turn
         let user = SessionManager::user_turn("Hello, ZeroClaw!");
@@ -490,33 +808,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_most_recent_returns_latest() {
+        let (_tmp, mut mgr) = setup().await;
+
+        mgr.new_named_session("first").await.unwrap();
+        let turn = SessionManager::user_turn("hello");
+        mgr.append_turn(&turn).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        mgr.new_named_session("second").await.unwrap();
+        let turn = SessionManager::user_turn("world");
+        mgr.append_turn(&turn).await.unwrap();
+
+        let latest = mgr.find_most_recent().await.unwrap();
+        assert!(latest.is_some());
+        let latest_path = latest.unwrap();
+        assert!(latest_path.to_str().unwrap().contains("second"));
+    }
+
+    #[tokio::test]
     async fn find_todays_latest_returns_most_recent() {
         let (_tmp, mut mgr) = setup().await;
 
-        // Create two sessions
-        let _id1 = mgr.new_session().await.unwrap();
-        let path1 = mgr.session_path().unwrap().to_path_buf();
+        mgr.new_named_session("first").await.unwrap();
+        let turn = SessionManager::user_turn("hello");
+        mgr.append_turn(&turn).await.unwrap();
 
-        // Small delay to ensure different mtime
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let id2 = mgr.new_session().await.unwrap();
-        let path2 = mgr.session_path().unwrap().to_path_buf();
-
-        // Write something to path2 so it has a later mtime
-        let turn = SessionManager::user_turn("hello");
+        mgr.new_named_session("second").await.unwrap();
+        let turn = SessionManager::user_turn("world");
         mgr.append_turn(&turn).await.unwrap();
 
         let latest = mgr.find_todays_latest().await.unwrap();
         assert!(latest.is_some());
-        assert_eq!(latest.unwrap(), path2);
     }
 
     #[tokio::test]
     async fn list_sessions_returns_metadata() {
         let (_tmp, mut mgr) = setup().await;
 
-        mgr.new_session().await.unwrap();
+        mgr.new_named_session("project-a").await.unwrap();
         let turn = SessionManager::user_turn("hello");
         mgr.append_turn(&turn).await.unwrap();
         let turn = SessionManager::assistant_turn(Some("world"), vec![]);
@@ -524,32 +857,89 @@ mod tests {
 
         let sessions = mgr.list_sessions(10).await.unwrap();
         assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "project-a");
         assert_eq!(sessions[0].turn_count, 2);
-        assert_eq!(sessions[0].date, Local::now().date_naive());
     }
 
     #[tokio::test]
-    async fn resume_session_loads_turns() {
+    async fn resume_named_session_loads_turns() {
         let (_tmp, mut mgr) = setup().await;
-        mgr.new_session().await.unwrap();
+        mgr.new_named_session("test-resume").await.unwrap();
 
         let user = SessionManager::user_turn("First message");
         mgr.append_turn(&user).await.unwrap();
-        let path = mgr.session_path().unwrap().to_path_buf();
 
         // Create a new manager and resume
         let mut mgr2 = SessionManager::new(_tmp.path());
-        let turns = mgr2.resume_session(&path).await.unwrap();
+        let turns = mgr2.resume_named_session("test-resume").await.unwrap();
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content.as_deref(), Some("First message"));
-        assert!(mgr2.session_id().is_some());
+        assert_eq!(mgr2.session_name(), Some("test-resume"));
+    }
+
+    #[tokio::test]
+    async fn switch_session_works() {
+        let (_tmp, mut mgr) = setup().await;
+
+        mgr.new_named_session("session-a").await.unwrap();
+        let turn = SessionManager::user_turn("Message in A");
+        mgr.append_turn(&turn).await.unwrap();
+
+        mgr.new_named_session("session-b").await.unwrap();
+        let turn = SessionManager::user_turn("Message in B");
+        mgr.append_turn(&turn).await.unwrap();
+
+        // Switch back to A
+        let turns = mgr.switch_session("session-a").await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content.as_deref(), Some("Message in A"));
+        assert_eq!(mgr.session_name(), Some("session-a"));
+    }
+
+    #[tokio::test]
+    async fn switch_to_nonexistent_errors() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("exists").await.unwrap();
+        let result = mgr.switch_session("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_works() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("old-name").await.unwrap();
+        let turn = SessionManager::user_turn("hello");
+        mgr.append_turn(&turn).await.unwrap();
+
+        let new_name = mgr.rename_session("new-name").await.unwrap();
+        assert_eq!(new_name, "new-name");
+        assert_eq!(mgr.session_name(), Some("new-name"));
+
+        // Old dir should be gone, new dir should exist
+        assert!(!mgr.session_dir_for("old-name").exists());
+        assert!(mgr.session_dir_for("new-name").exists());
+
+        // Should still be able to load turns
+        let turns = mgr.load_turns(mgr.session_path().unwrap()).await.unwrap();
+        assert_eq!(turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_to_existing_name_errors() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("first").await.unwrap();
+        mgr.new_named_session("second").await.unwrap();
+        let result = mgr.rename_session("first").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
     }
 
     #[tokio::test]
     async fn session_files_are_human_readable() {
         let (_tmp, mut mgr) = setup().await;
-        mgr.new_session().await.unwrap();
+        mgr.new_named_session("readable").await.unwrap();
 
         let turn = SessionManager::user_turn("Can you help me debug this?");
         mgr.append_turn(&turn).await.unwrap();
@@ -591,10 +981,84 @@ mod tests {
     #[tokio::test]
     async fn empty_session_has_zero_turns() {
         let (_tmp, mut mgr) = setup().await;
-        mgr.new_session().await.unwrap();
+        mgr.new_named_session("empty").await.unwrap();
 
         let sessions = mgr.list_sessions(10).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].turn_count, 0);
+    }
+
+    #[tokio::test]
+    async fn slugify_basic() {
+        assert_eq!(slugify("my-project"), "my-project");
+        assert_eq!(slugify("My Project!"), "my-project");
+        assert_eq!(slugify("  Hello World  "), "hello-world");
+        assert_eq!(slugify("foo---bar"), "foo-bar");
+        assert_eq!(slugify("CamelCase"), "camelcase");
+        assert_eq!(slugify("with_underscores"), "with-underscores");
+        assert_eq!(slugify("!!!"), "unnamed");
+    }
+
+    #[tokio::test]
+    async fn slugify_preserves_numbers() {
+        assert_eq!(slugify("project-42"), "project-42");
+        assert_eq!(slugify("v2.0"), "v2-0");
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_most_recent_across_names() {
+        let (_tmp, mut mgr) = setup().await;
+
+        // Create several sessions with different last_active times
+        mgr.new_named_session("old-project").await.unwrap();
+        let turn = SessionManager::user_turn("old message");
+        mgr.append_turn(&turn).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        mgr.new_named_session("new-project").await.unwrap();
+        let turn = SessionManager::user_turn("new message");
+        mgr.append_turn(&turn).await.unwrap();
+
+        // A fresh manager should find the most recent
+        let fresh_mgr = SessionManager::new(_tmp.path());
+        let latest = fresh_mgr.find_most_recent().await.unwrap();
+        assert!(latest.is_some());
+        assert!(latest.unwrap().to_str().unwrap().contains("new-project"));
+    }
+
+    #[tokio::test]
+    async fn session_meta_is_persisted() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("meta-test").await.unwrap();
+
+        let meta = mgr.read_meta("meta-test").await.unwrap();
+        assert_eq!(meta.name, "meta-test");
+        assert!(!meta.created_at.is_empty());
+        assert!(!meta.last_active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_flat_file_resume_works() {
+        let (tmp, mut mgr) = setup().await;
+        // Create a legacy-style flat JSONL file
+        let sessions_dir = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).await.unwrap();
+
+        let legacy_path = sessions_dir.join("2026-02-15_abc12345.jsonl");
+        let turn = SessionTurn {
+            role: "user".to_string(),
+            content: Some("Legacy message".to_string()),
+            tool_calls: vec![],
+            tool_results: vec![],
+            timestamp: "2026-02-15T10:00:00+00:00".to_string(),
+        };
+        let line = serde_json::to_string(&turn).unwrap() + "\n";
+        fs::write(&legacy_path, &line).await.unwrap();
+
+        let turns = mgr.resume_session(&legacy_path).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content.as_deref(), Some("Legacy message"));
+        assert_eq!(mgr.session_id(), Some("abc12345"));
     }
 }
