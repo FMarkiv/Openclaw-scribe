@@ -32,6 +32,15 @@
 //! to write a `## Morning Summary` to today's daily note — giving an e-ink
 //! display a fresh summary each morning without user action.
 //!
+//! ## Async subagent spawning
+//!
+//! The `subagent` module provides non-blocking background task execution.
+//! When a heartbeat fires, it spawns a subagent via `tokio::spawn` instead
+//! of running inline. The subagent gets its own ephemeral conversation
+//! history, shares read access to markdown memory, and writes results to
+//! daily notes using file-locked atomic appends. A `/tasks` command shows
+//! running subagents, last completion time, and last error.
+//!
 //! ## Telegram bot
 //!
 //! The `telegram` module provides a Telegram bot channel using HTTP
@@ -137,6 +146,7 @@ pub mod session;
 pub mod session_tools;
 pub mod silent;
 pub mod startup;
+pub mod subagent;
 pub mod telegram;
 pub mod web_tools;
 
