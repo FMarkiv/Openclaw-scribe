@@ -1,0 +1,54 @@
+# ZeroClaw + Openclaw-Scribe Configuration
+# ──────────────────────────────────────────
+#
+# This file configures the ZeroClaw agent with Openclaw-Scribe extensions.
+# Copy this file to ~/.zeroclaw/config.toml and customize.
+
+# ── Provider ─────────────────────────────────────────────────────
+[provider]
+# name = "anthropic"     # anthropic | openai | ollama | openrouter | compatible
+# api_key = "sk-..."     # Or set ANTHROPIC_API_KEY / OPENAI_API_KEY env var
+# model = "claude-sonnet-4-20250514"
+
+# ── Workspace ────────────────────────────────────────────────────
+[workspace]
+# root = "."             # Path to workspace root (contains SOUL.md, MEMORY.md, etc.)
+
+# ── Web Search ───────────────────────────────────────────────────
+# brave_api_key = ""     # Or set BRAVE_API_KEY env var
+
+# ── Telegram Bot ─────────────────────────────────────────────────
+#
+# Enable a Telegram bot channel that runs alongside the CLI.
+# The bot uses HTTP long-polling (no public IP or webhooks needed).
+#
+# To set up:
+# 1. Message @BotFather on Telegram and create a bot
+# 2. Copy the bot token below (or set TELEGRAM_BOT_TOKEN env var)
+# 3. Set enabled = true (or pass --telegram on the CLI)
+# 4. Start ZeroClaw — the bot will begin polling for messages
+#
+# The Telegram listener shares the same agent, memory, tools, and
+# session persistence as the CLI. Both can run simultaneously.
+#
+[telegram]
+# bot_token = "123456789:AAF-your-bot-token-here"
+# enabled = false
+
+# Polling interval in seconds. Lower = more responsive, higher = less CPU.
+# Default: 5 seconds. Minimum: 1 second.
+poll_interval_secs = 5
+
+# Long-polling timeout in seconds. Telegram holds the connection open
+# for this long before returning an empty response. Higher values reduce
+# the number of HTTP requests. Default: 30 seconds.
+long_poll_timeout_secs = 30
+
+# ── Security ─────────────────────────────────────────────────────
+# [security]
+# shell_allowlist = ["git", "cargo", "npm", "ls", "cat", "grep"]
+# readonly = false
+
+# ── Browser ──────────────────────────────────────────────────────
+# [browser]
+# domain_allowlist = []

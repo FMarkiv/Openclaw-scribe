@@ -6,9 +6,12 @@ Patches, documentation, and extensions for the [Zeroclaw](https://github.com/the
 
 - `zeroclaw-evaluation.md` — Evaluation report of the Zeroclaw project
 - `nvidia-nim-compatibility.md` — NVIDIA NIM compatibility analysis
+- `config.toml` — Example configuration file (copy to `~/.zeroclaw/config.toml`)
 - `zeroclaw-patches/` — Patches for Zeroclaw
   - `tool-use-wiring.patch` — Multi-turn tool-use support for all providers
   - `markdown-memory-integration.patch` — Agent loop integration for markdown memory
+  - `session-persistence.patch` — JSONL session persistence
+  - `telegram-bot-integration.patch` — Telegram bot channel (long-polling)
 
 ## Markdown Memory System
 
@@ -70,3 +73,49 @@ Apply `zeroclaw-patches/markdown-memory-integration.patch` to wire the markdown 
 5. Registers all four markdown memory tools alongside existing tools
 
 The SQLite memory backend remains available — the markdown tools are additive. Both systems can coexist.
+
+## Telegram Bot Channel
+
+A Telegram bot that uses HTTP long-polling (not webhooks) to receive messages and route them through the same agent pipeline as the CLI. No public IP or TLS certificate needed.
+
+### Setup
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram and create a bot
+2. Copy the bot token
+3. Configure via one of:
+   - `config.toml`: set `[telegram] bot_token = "..."` and `enabled = true`
+   - Environment variable: `export TELEGRAM_BOT_TOKEN="..."`
+   - CLI flag: `zeroclaw run --telegram`
+
+### Configuration
+
+```toml
+[telegram]
+bot_token = "123456789:AAF-your-bot-token-here"
+enabled = true
+poll_interval_secs = 5         # How often to poll (default: 5s)
+long_poll_timeout_secs = 30    # Telegram long-poll timeout (default: 30s)
+```
+
+### Features
+
+- **Long-polling**: Polls `getUpdates` every N seconds — low CPU, no webhooks
+- **Shared agent**: Uses the same agent loop, tools, and memory as the CLI
+- **Session persistence**: Telegram turns are written to the same JSONL session files
+- **Daily notes**: All Telegram interactions appear in today's daily note
+- **Simultaneous operation**: Telegram listener and CLI run concurrently (shared agent, shared memory, separate message streams)
+- **Message splitting**: Long responses are automatically split at Telegram's 4096-char limit
+
+### Rust Source
+
+- `src/memory/telegram.rs` — `TelegramListener`, `TelegramApi`, `TelegramConfig`, Telegram API types
+
+### Integration
+
+Apply `zeroclaw-patches/telegram-bot-integration.patch` to wire the Telegram listener into Zeroclaw's agent loop. The patch:
+
+1. Adds the `--telegram` CLI flag
+2. Adds `[telegram]` config section parsing
+3. Starts the polling listener as a background tokio task
+4. Routes incoming Telegram messages through the same `agent_loop()`
+5. Sends responses back via `sendMessage`

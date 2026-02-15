@@ -32,6 +32,15 @@
 //! to write a `## Morning Summary` to today's daily note — giving an e-ink
 //! display a fresh summary each morning without user action.
 //!
+//! ## Telegram bot
+//!
+//! The `telegram` module provides a Telegram bot channel using HTTP
+//! long-polling (not webhooks). It polls `getUpdates` at a configurable
+//! interval (default 5 seconds), parses incoming messages, and routes
+//! them through the same agent loop as the CLI. Responses are sent back
+//! via `sendMessage`. The Telegram listener shares the same session
+//! persistence, memory, and tools as the CLI — both can run simultaneously.
+//!
 //! ## File Layout
 //!
 //! ```text
@@ -83,7 +92,7 @@
 //!
 //! // Register tools in the agent loop
 //! let mut tools = markdown_tools::all_markdown_tools(md_mem.clone());
-//! tools.extend(session_tools::all_session_tools(session_mgr));
+//! tools.extend(session_tools::all_session_tools(session_mgr.clone()));
 //! tools.extend(web_tools::all_web_tools(config.brave_api_key.clone()));
 //! tools.push(heartbeat::heartbeat_tool(heartbeat_mgr));
 //!
@@ -91,6 +100,17 @@
 //! // if is_silent_response(&response) {
 //! //     // Persist turn but don't display to user
 //! // }
+//!
+//! // Optional: start Telegram listener alongside CLI
+//! use crate::memory::telegram::{TelegramConfig, TelegramListener};
+//! let tg_config = TelegramConfig::new(config.telegram_bot_token.clone());
+//! let tg_listener = TelegramListener::new(
+//!     tg_config,
+//!     md_mem.clone(),
+//!     session_mgr.clone(),
+//! ).unwrap();
+//! let (mut tg_rx, _tg_handle) = tg_listener.start_polling();
+//! // Process tg_rx messages through the same agent loop
 //! ```
 
 pub mod context;
@@ -101,4 +121,5 @@ pub mod session;
 pub mod session_tools;
 pub mod silent;
 pub mod startup;
+pub mod telegram;
 pub mod web_tools;
