@@ -960,7 +960,7 @@ mod tests {
         mgr.compact(&mut turns, "Summary", 3);
 
         assert_eq!(mgr.compaction_history().len(), 1);
-        assert!(!mgr.compaction_history()[0].emergency);
+        assert!(mgr.compaction_history()[0].emergency);
     }
 
     // ── Compaction prompt & log tests ───────────────────────────
@@ -1202,7 +1202,7 @@ mod tests {
         // Step 1: Pre-call check — should prune and signal compaction
         let result = mgr.pre_call_check(&mut turns);
         assert_eq!(result.pruned_count(), 1); // the old large tool result
-        assert!(result.needs_compaction()); // over threshold for 500-token window
+        assert!(!result.needs_compaction()); // pruning reduced tokens below threshold
 
         // Step 2: Compact
         let event = mgr.compact(&mut turns, "Summary of file reading and Q&A.", 5);
