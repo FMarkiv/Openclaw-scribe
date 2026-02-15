@@ -151,6 +151,7 @@ pub mod silent;
 pub mod startup;
 pub mod subagent;
 pub mod telegram;
+pub mod telegram_rich;
 pub mod web_tools;
 
 // ── Memory trait and types ──────────────────────────────────────────

@@ -62,6 +62,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::memory::markdown::MarkdownMemory;
 use crate::memory::session::SessionManager;
+use crate::memory::telegram_rich::{
+    TelegramDocument, TelegramPhotoSize, TelegramRichClient, TelegramVoice,
+};
 
 // ── Telegram API types ──────────────────────────────────────────
 
@@ -87,6 +90,18 @@ pub struct TelegramMessage {
     pub text: Option<String>,
     /// Date the message was sent (Unix timestamp).
     pub date: i64,
+    /// Document attachment (files, PDFs, etc.).
+    #[serde(default)]
+    pub document: Option<TelegramDocument>,
+    /// Photo attachment (array of sizes, largest last).
+    #[serde(default)]
+    pub photo: Option<Vec<TelegramPhotoSize>>,
+    /// Voice message attachment.
+    #[serde(default)]
+    pub voice: Option<TelegramVoice>,
+    /// Caption for media messages.
+    #[serde(default)]
+    pub caption: Option<String>,
 }
 
 /// A Telegram User object (subset).
@@ -150,6 +165,9 @@ pub struct IncomingTelegramMessage {
     pub sender_id: i64,
     /// Original Telegram message ID (for threading/logging).
     pub message_id: i64,
+    /// System message about a file attachment (if any).
+    /// e.g. "User sent file: report.pdf (125 KB). Saved to /workspace/downloads/report.pdf"
+    pub attachment_info: Option<String>,
 }
 
 // ── Telegram bot configuration ──────────────────────────────────
@@ -352,6 +370,7 @@ pub struct TelegramListener {
     api: Arc<TelegramApi>,
     memory: Arc<MarkdownMemory>,
     session_mgr: Arc<Mutex<SessionManager>>,
+    rich_client: Option<Arc<TelegramRichClient>>,
 }
 
 impl TelegramListener {
@@ -368,11 +387,17 @@ impl TelegramListener {
 
         let api = Arc::new(TelegramApi::new(&token)?);
 
+        // Rich client is best-effort — workspace path from memory
+        let rich_client = TelegramRichClient::new(&token, memory.base_dir())
+            .ok()
+            .map(Arc::new);
+
         Ok(Self {
             config,
             api,
             memory,
             session_mgr,
+            rich_client,
         })
     }
 
@@ -380,6 +405,13 @@ impl TelegramListener {
     /// from outside the listener, e.g., from the agent loop).
     pub fn api(&self) -> &Arc<TelegramApi> {
         &self.api
+    }
+
+    /// Get a reference to the rich client (for MarkdownV2 formatting,
+    /// reactions, file sending, etc.). Returns `None` if initialization
+    /// failed.
+    pub fn rich_client(&self) -> Option<&Arc<TelegramRichClient>> {
+        self.rich_client.as_ref()
     }
 
     /// Start the polling loop in a background task.
@@ -402,6 +434,8 @@ impl TelegramListener {
         let long_poll_timeout = self.config.long_poll_timeout_secs;
         let memory = self.memory.clone();
 
+        let rich = self.rich_client.clone();
+
         let handle = tokio::spawn(async move {
             let mut offset: Option<i64> = None;
 
@@ -412,53 +446,107 @@ impl TelegramListener {
                             // Advance the offset to acknowledge this update
                             offset = Some(update.update_id + 1);
 
-                            // Only process text messages
                             if let Some(msg) = update.message {
-                                if let Some(text) = msg.text {
-                                    let sender_name = msg
-                                        .from
-                                        .as_ref()
-                                        .map(|u| {
-                                            let mut name = u.first_name.clone();
-                                            if let Some(ref last) = u.last_name {
-                                                name.push(' ');
-                                                name.push_str(last);
+                                let sender_name = msg
+                                    .from
+                                    .as_ref()
+                                    .map(|u| {
+                                        let mut name = u.first_name.clone();
+                                        if let Some(ref last) = u.last_name {
+                                            name.push(' ');
+                                            name.push_str(last);
+                                        }
+                                        name
+                                    })
+                                    .unwrap_or_else(|| "Unknown".to_string());
+
+                                let sender_id = msg
+                                    .from
+                                    .as_ref()
+                                    .map(|u| u.id)
+                                    .unwrap_or(0);
+
+                                // Handle file attachments via rich client
+                                let attachment_info = if let Some(ref rc) = rich {
+                                    if let Some(ref doc) = msg.document {
+                                        match rc.handle_incoming_document(doc).await {
+                                            Ok((_path, info)) => Some(info),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[telegram] Failed to download document: {e}"
+                                                );
+                                                None
                                             }
-                                            name
-                                        })
-                                        .unwrap_or_else(|| "Unknown".to_string());
+                                        }
+                                    } else if let Some(ref photos) = msg.photo {
+                                        if !photos.is_empty() {
+                                            match rc.handle_incoming_photo(photos).await {
+                                                Ok((_path, info)) => Some(info),
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "[telegram] Failed to download photo: {e}"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else if let Some(ref voice) = msg.voice {
+                                        match rc.handle_incoming_voice(voice).await {
+                                            Ok((_path, info)) => Some(info),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[telegram] Failed to download voice: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
 
-                                    let sender_id = msg
-                                        .from
-                                        .as_ref()
-                                        .map(|u| u.id)
-                                        .unwrap_or(0);
+                                // Build text: use message text, caption, or attachment info
+                                let text = msg
+                                    .text
+                                    .clone()
+                                    .or_else(|| msg.caption.clone())
+                                    .or_else(|| attachment_info.clone())
+                                    .unwrap_or_default();
 
-                                    // Log to daily note
-                                    let log_entry = format!(
-                                        "**[telegram]** Message from {sender_name}: {text}"
+                                if text.is_empty() && attachment_info.is_none() {
+                                    // Nothing we can process (sticker, animation, etc.)
+                                    continue;
+                                }
+
+                                // Log to daily note
+                                let log_entry = format!(
+                                    "**[telegram]** Message from {sender_name}: {text}"
+                                );
+                                if let Err(e) = memory.append_daily_note(&log_entry).await {
+                                    eprintln!(
+                                        "[telegram] Failed to log to daily note: {e}"
                                     );
-                                    if let Err(e) = memory.append_daily_note(&log_entry).await {
-                                        eprintln!(
-                                            "[telegram] Failed to log to daily note: {e}"
-                                        );
-                                    }
+                                }
 
-                                    let incoming = IncomingTelegramMessage {
-                                        chat_id: msg.chat.id,
-                                        text,
-                                        sender_name,
-                                        sender_id,
-                                        message_id: msg.message_id,
-                                    };
+                                let incoming = IncomingTelegramMessage {
+                                    chat_id: msg.chat.id,
+                                    text,
+                                    sender_name,
+                                    sender_id,
+                                    message_id: msg.message_id,
+                                    attachment_info,
+                                };
 
-                                    if tx.send(incoming).await.is_err() {
-                                        // Receiver dropped — agent loop shut down
-                                        eprintln!(
-                                            "[telegram] Message channel closed, stopping poller"
-                                        );
-                                        return;
-                                    }
+                                if tx.send(incoming).await.is_err() {
+                                    // Receiver dropped — agent loop shut down
+                                    eprintln!(
+                                        "[telegram] Message channel closed, stopping poller"
+                                    );
+                                    return;
                                 }
                             }
                         }
@@ -967,11 +1055,97 @@ mod tests {
             sender_name: "Alice".to_string(),
             sender_id: 100,
             message_id: 42,
+            attachment_info: None,
         };
         assert_eq!(msg.chat_id, 12345);
         assert_eq!(msg.text, "Hello!");
         assert_eq!(msg.sender_name, "Alice");
         assert_eq!(msg.sender_id, 100);
         assert_eq!(msg.message_id, 42);
+        assert!(msg.attachment_info.is_none());
+    }
+
+    #[test]
+    fn incoming_message_with_attachment() {
+        let msg = IncomingTelegramMessage {
+            chat_id: 12345,
+            text: "Check this file".to_string(),
+            sender_name: "Bob".to_string(),
+            sender_id: 200,
+            message_id: 99,
+            attachment_info: Some("User sent file: doc.pdf (1.5 MB). Saved to /workspace/downloads/doc.pdf".to_string()),
+        };
+        assert!(msg.attachment_info.is_some());
+        assert!(msg.attachment_info.unwrap().contains("doc.pdf"));
+    }
+
+    // ── TelegramMessage with attachment deserialization ──────────
+
+    #[test]
+    fn deserialize_message_with_document() {
+        let json = r#"{
+            "update_id": 1,
+            "message": {
+                "message_id": 50,
+                "chat": {"id": 1, "type": "private"},
+                "date": 1707900000,
+                "document": {
+                    "file_id": "BQACAgIAAxkBAAI",
+                    "file_name": "report.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 125000
+                },
+                "caption": "Here is the report"
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert!(msg.document.is_some());
+        let doc = msg.document.unwrap();
+        assert_eq!(doc.file_name.as_deref(), Some("report.pdf"));
+        assert_eq!(msg.caption.as_deref(), Some("Here is the report"));
+    }
+
+    #[test]
+    fn deserialize_message_with_photo() {
+        let json = r#"{
+            "update_id": 2,
+            "message": {
+                "message_id": 51,
+                "chat": {"id": 1, "type": "private"},
+                "date": 1707900000,
+                "photo": [
+                    {"file_id": "small", "width": 90, "height": 90},
+                    {"file_id": "large", "width": 1280, "height": 720, "file_size": 98765}
+                ]
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        let photos = msg.photo.unwrap();
+        assert_eq!(photos.len(), 2);
+        assert_eq!(photos[1].width, 1280);
+    }
+
+    #[test]
+    fn deserialize_message_with_voice() {
+        let json = r#"{
+            "update_id": 3,
+            "message": {
+                "message_id": 52,
+                "chat": {"id": 1, "type": "private"},
+                "date": 1707900000,
+                "voice": {
+                    "file_id": "AwACAgIAAxkBAAI",
+                    "duration": 5,
+                    "mime_type": "audio/ogg",
+                    "file_size": 12345
+                }
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        let voice = msg.voice.unwrap();
+        assert_eq!(voice.duration, 5);
     }
 }
