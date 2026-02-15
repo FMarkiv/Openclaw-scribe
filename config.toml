@@ -92,3 +92,27 @@ long_poll_timeout_secs = 30
 # ── Browser ──────────────────────────────────────────────────────
 # [browser]
 # domain_allowlist = []
+
+# ── Composio ─────────────────────────────────────────────────────
+#
+# Composio integration for connecting to external apps (Gmail,
+# Google Calendar, GitHub, Notion, etc.) via OAuth. Composio handles
+# OAuth flows and provides a unified API for 250+ apps.
+#
+# To set up:
+# 1. Create an account at https://composio.dev
+# 2. Get your API key from the dashboard
+# 3. Set enabled = true and add your API key below (or set COMPOSIO_API_KEY env var)
+# 4. Use /connect <app> to connect apps (e.g. /connect gmail)
+#
+# Commands:
+#   /connect <app>         — Start OAuth flow, show authorization URL
+#   /connect-check <app>   — Verify if app is connected
+#   /connections           — List all connected apps
+#   /disconnect <app>      — Remove app connection
+#   /composio-actions <app> — List available actions for an app
+#
+# [composio]
+# enabled = false
+# api_key = ""                                    # Or set COMPOSIO_API_KEY env var
+# base_url = "https://backend.composio.dev/api/v2"
