@@ -127,10 +127,12 @@
 //! ```
 
 pub mod context;
+pub mod failover;
 pub mod file_tools;
 pub mod heartbeat;
 pub mod markdown;
 pub mod markdown_tools;
+pub mod provider_tools;
 pub mod session;
 pub mod session_tools;
 pub mod silent;
