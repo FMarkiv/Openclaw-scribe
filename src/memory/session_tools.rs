@@ -8,19 +8,12 @@
 //! - `session_list`     — list recent sessions (the `/sessions` command)
 
 use crate::memory::session::{SessionInfo, SessionManager};
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-/// Result type returned by tool execution (matches markdown_tools convention).
-pub struct ToolExecutionResult {
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-}
 
 // ── session_new ──────────────────────────────────────────────────
 

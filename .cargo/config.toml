@@ -1,0 +1,31 @@
+# Cross-compilation configuration for Raspberry Pi Zero 2W (aarch64)
+#
+# The Pi Zero 2W uses a Broadcom BCM2710A1 (Cortex-A53, ARMv8-A).
+# We target aarch64-unknown-linux-musl for a fully static binary
+# that needs no shared libraries on the Pi — just scp and run.
+#
+# We use rust-lld (shipped with Rust) as the linker and clang as the
+# C compiler so no system cross-compiler (gcc-aarch64-linux-gnu) is
+# needed — both are already available in most dev environments.
+#
+# A minimal sysroot (cross/aarch64-sysroot/) provides the few C
+# headers needed by ring's crypto code.
+#
+# NOTE: The -isystem path may need adjusting for your clang version.
+# Run `clang --print-resource-dir` to find your clang include dir,
+# then append /include.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+# Also keep gnu config for library-only builds
+[target.aarch64-unknown-linux-gnu]
+linker = "rust-lld"
+
+[env]
+CC_aarch64-unknown-linux-musl = "clang"
+AR_aarch64-unknown-linux-musl = "llvm-ar"
+CFLAGS_aarch64-unknown-linux-musl = "--target=aarch64-unknown-linux-musl --sysroot=cross/aarch64-sysroot -isystem /usr/lib/llvm-18/lib/clang/18/include"
+CC_aarch64-unknown-linux-gnu = "clang"
+AR_aarch64-unknown-linux-gnu = "llvm-ar"
+CFLAGS_aarch64-unknown-linux-gnu = "--target=aarch64-unknown-linux-gnu --sysroot=cross/aarch64-sysroot -isystem /usr/lib/llvm-18/lib/clang/18/include"

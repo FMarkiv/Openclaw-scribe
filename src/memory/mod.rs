@@ -123,3 +123,47 @@ pub mod silent;
 pub mod startup;
 pub mod telegram;
 pub mod web_tools;
+
+// ── Memory trait and types ──────────────────────────────────────────
+//
+// These are defined here so that MarkdownMemory can implement the
+// Memory trait as a drop-in replacement for the SQLite backend.
+
+use anyhow::Result;
+use async_trait::async_trait;
+
+/// Category tag for a memory entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryCategory {
+    General,
+    Decision,
+    Discovery,
+    Todo,
+    Bug,
+    Context,
+    Custom(String),
+}
+
+/// A single memory entry returned by recall/list.
+#[derive(Debug, Clone)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub score: Option<f64>,
+}
+
+/// Trait for memory backends (SQLite, Markdown, etc.).
+#[async_trait]
+pub trait Memory: Send + Sync {
+    /// Store a memory entry.
+    async fn store(&self, key: &str, content: &str, category: &str) -> Result<()>;
+    /// Recall memories matching a query.
+    async fn recall(&self, query: &str) -> Result<Vec<MemoryEntry>>;
+    /// Get a specific entry by key.
+    async fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Forget (delete) an entry by key.
+    async fn forget(&self, key: &str) -> Result<()>;
+    /// List entries in a category.
+    async fn list(&self, category: &str) -> Result<Vec<MemoryEntry>>;
+}

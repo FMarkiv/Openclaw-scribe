@@ -10,18 +10,11 @@
 //! - `memory_promote` — move important content to long-term MEMORY.md
 
 use crate::memory::markdown::MarkdownMemory;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
-
-/// Result type returned by tool execution.
-pub struct ToolExecutionResult {
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-}
 
 // ── memory_store ─────────────────────────────────────────────────
 

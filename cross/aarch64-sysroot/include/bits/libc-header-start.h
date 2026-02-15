@@ -1,0 +1,3 @@
+#ifndef _BITS_LIBC_HEADER_START_H
+#define _BITS_LIBC_HEADER_START_H
+#endif

@@ -24,7 +24,7 @@
 //!    retries once.
 
 use crate::memory::markdown::MarkdownMemory;
-use crate::memory::session::{SessionManager, SessionTurn, PersistedToolCall, PersistedToolResult};
+use crate::memory::session::{SessionManager, SessionTurn};
 use anyhow::{Context as AnyhowContext, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
