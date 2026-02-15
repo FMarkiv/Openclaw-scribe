@@ -53,9 +53,21 @@
 //! │   ├── 2026-02-13.md    — Yesterday's daily note
 //! │   └── 2026-02-14.md    — Today's daily note
 //! └── sessions/
-//!     ├── 2026-02-13_a1b2c3d4.jsonl  — Previous session
-//!     └── 2026-02-14_e5f6g7h8.jsonl  — Today's session
+//!     ├── default/
+//!     │   ├── session.jsonl — Default session turns
+//!     │   └── session.json  — Session metadata
+//!     └── scribe-hardware/
+//!         ├── session.jsonl — Named session turns
+//!         └── session.json  — Session metadata
 //! ```
+//!
+//! ## Named Sessions
+//!
+//! Sessions are identified by slugified names (lowercase, hyphens).
+//! Local commands (`/new`, `/switch`, `/sessions`, `/rename`) are
+//! intercepted in the input handler before reaching the LLM.
+//! On startup, the most recently active session across all names
+//! is resumed automatically.
 //!
 //! ## Usage
 //!
@@ -74,8 +86,9 @@
 //! let md_mem = Arc::new(MarkdownMemory::new("./workspace"));
 //! let session_mgr = Arc::new(Mutex::new(SessionManager::new("./workspace")));
 //!
-//! // Load context for system prompt injection
-//! let context = md_mem.load_session_context().await?;
+//! // Load context for system prompt injection (with session name)
+//! let session_name = session_mgr.lock().await.session_name().map(|s| s.to_string());
+//! let context = md_mem.load_session_context_named(session_name.as_deref()).await?;
 //!
 //! // Set up context window management
 //! let mut ctx_mgr = ContextManager::for_provider("anthropic");

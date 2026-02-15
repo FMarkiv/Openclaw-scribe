@@ -92,8 +92,24 @@ impl MarkdownMemory {
     /// Returns a string containing SOUL.md + USER.md + MEMORY.md +
     /// yesterday's daily note + today's daily note, each clearly
     /// delimited with headers.
+    ///
+    /// If `session_name` is provided, it is included as a session
+    /// context header so the LLM knows which project context it's in.
     pub async fn load_session_context(&self) -> Result<String> {
+        self.load_session_context_named(None).await
+    }
+
+    /// Load session context with an optional session name injected.
+    pub async fn load_session_context_named(
+        &self,
+        session_name: Option<&str>,
+    ) -> Result<String> {
         let mut context = String::new();
+
+        // Session name — so the LLM knows which project context it's in
+        if let Some(name) = session_name {
+            context.push_str(&format!("=== Active Session: {name} ===\n\n"));
+        }
 
         // SOUL.md — always loaded
         if let Some(soul) = self.read_file_if_exists(&self.soul_path()).await? {
@@ -543,5 +559,26 @@ mod tests {
         // No files exist — should return empty context without error
         let ctx = mem.load_session_context().await.unwrap();
         assert!(ctx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_session_context_named_includes_session_name() {
+        let (_tmp, mem) = setup().await;
+
+        let ctx = mem
+            .load_session_context_named(Some("scribe-hardware"))
+            .await
+            .unwrap();
+        assert!(ctx.contains("=== Active Session: scribe-hardware ==="));
+        assert!(ctx.contains("SOUL (Agent Identity)"));
+    }
+
+    #[tokio::test]
+    async fn load_session_context_named_none_matches_unnamed() {
+        let (_tmp, mem) = setup().await;
+
+        let ctx_unnamed = mem.load_session_context().await.unwrap();
+        let ctx_none = mem.load_session_context_named(None).await.unwrap();
+        assert_eq!(ctx_unnamed, ctx_none);
     }
 }
