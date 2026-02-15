@@ -142,6 +142,7 @@ pub mod heartbeat;
 pub mod markdown;
 pub mod markdown_tools;
 pub mod provider_tools;
+pub mod sandbox;
 pub mod session;
 pub mod session_tools;
 pub mod silent;

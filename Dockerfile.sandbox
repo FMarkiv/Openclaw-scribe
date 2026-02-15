@@ -1,0 +1,30 @@
+# Minimal sandbox image for ZeroClaw shell command execution.
+#
+# Build:
+#   docker build -f Dockerfile.sandbox -t zeroclaw-sandbox:latest .
+#
+# This image is used when [sandbox] enabled = true in config.toml.
+# Each shell command runs in an ephemeral container (docker run --rm)
+# to isolate untrusted inputs from the host system.
+
+FROM alpine:latest
+
+# Install commonly-needed tools
+RUN apk add --no-cache \
+    bash \
+    git \
+    curl \
+    python3 \
+    build-base \
+    coreutils \
+    findutils \
+    grep \
+    sed \
+    gawk \
+    jq
+
+# Run as non-root user
+RUN adduser -D -h /workspace zeroclaw
+USER zeroclaw
+
+WORKDIR /workspace
