@@ -10,6 +10,7 @@
 //! - `memory_promote` — move important content to long-term MEMORY.md
 
 use crate::memory::markdown::MarkdownMemory;
+use crate::memory::memory_growth::parse_memory_content;
 use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -107,6 +108,32 @@ impl MemoryRecallTool {
     pub fn new(memory: Arc<MarkdownMemory>) -> Self {
         Self { memory }
     }
+
+    /// Update the reference tracker for entries matching a query.
+    ///
+    /// This tracks "last referenced" timestamps for stale entry scoring.
+    async fn touch_matching_entries(&self, query: &str) -> Result<()> {
+        let gc = self.memory.growth_controller();
+        let memory_content = match tokio::fs::read_to_string(gc.memory_path()).await {
+            Ok(c) => c,
+            Err(_) => return Ok(()), // No MEMORY.md — nothing to track
+        };
+
+        let (_, sections) = parse_memory_content(&memory_content);
+        let all_entries: Vec<_> = sections.iter()
+            .flat_map(|s| s.entries())
+            .collect();
+
+        if all_entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut tracker = gc.load_refs().await?;
+        tracker.touch_matching(&all_entries, query);
+        gc.save_refs(&tracker).await?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -151,6 +178,11 @@ impl Tool for MemoryRecallTool {
 
         match self.memory.search(&query).await {
             Ok(results) => {
+                // Track references for stale entry scoring
+                if let Err(e) = self.touch_matching_entries(&query).await {
+                    eprintln!("[memory_recall] Failed to update reference tracker: {e}");
+                }
+
                 if results.is_empty() {
                     Ok(ToolExecutionResult {
                         success: true,

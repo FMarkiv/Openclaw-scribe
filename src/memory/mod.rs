@@ -144,6 +144,7 @@ pub mod file_tools;
 pub mod heartbeat;
 pub mod markdown;
 pub mod markdown_tools;
+pub mod memory_growth;
 pub mod provider_tools;
 pub mod sandbox;
 pub mod session;
