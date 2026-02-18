@@ -14,6 +14,8 @@ use chrono::{Local, NaiveDate};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+use crate::memory::memory_growth::{MemoryConfig, MemoryGrowthController};
+
 /// A single search hit when recalling across markdown files.
 #[derive(Debug, Clone)]
 pub struct MarkdownSearchResult {
@@ -28,6 +30,8 @@ pub struct MarkdownSearchResult {
 /// File-based markdown memory backend.
 pub struct MarkdownMemory {
     base_dir: PathBuf,
+    /// Memory growth controller (lazily references the same base_dir).
+    memory_config: MemoryConfig,
 }
 
 impl MarkdownMemory {
@@ -46,7 +50,26 @@ impl MarkdownMemory {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            memory_config: MemoryConfig::default(),
         }
+    }
+
+    /// Create a new MarkdownMemory with custom memory growth configuration.
+    pub fn with_config(base_dir: impl Into<PathBuf>, config: MemoryConfig) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            memory_config: config,
+        }
+    }
+
+    /// Get a MemoryGrowthController for this memory instance.
+    pub fn growth_controller(&self) -> MemoryGrowthController {
+        MemoryGrowthController::new(&self.base_dir, self.memory_config.clone())
+    }
+
+    /// Get the memory growth configuration.
+    pub fn memory_config(&self) -> &MemoryConfig {
+        &self.memory_config
     }
 
     // ── Path helpers ─────────────────────────────────────────────
@@ -125,10 +148,11 @@ impl MarkdownMemory {
             context.push_str("\n\n");
         }
 
-        // MEMORY.md — long-term knowledge
-        if let Some(memory) = self.read_file_if_exists(&self.memory_path()).await? {
+        // MEMORY.md — long-term knowledge (selective loading)
+        let memory_content = self.load_memory_selective(&[]).await?;
+        if !memory_content.is_empty() {
             context.push_str("=== MEMORY (Long-Term Knowledge) ===\n");
-            context.push_str(&memory);
+            context.push_str(&memory_content);
             context.push_str("\n\n");
         }
 
@@ -154,6 +178,69 @@ impl MarkdownMemory {
         }
 
         Ok(context)
+    }
+
+    /// Load session context with selective memory loading based on recent messages.
+    ///
+    /// This is the preferred method when recent conversation messages are available,
+    /// as it enables keyword-based section matching for leaner system prompts.
+    pub async fn load_session_context_with_messages(
+        &self,
+        session_name: Option<&str>,
+        recent_messages: &[String],
+    ) -> Result<String> {
+        let mut context = String::new();
+
+        if let Some(name) = session_name {
+            context.push_str(&format!("=== Active Session: {name} ===\n\n"));
+        }
+
+        if let Some(soul) = self.read_file_if_exists(&self.soul_path()).await? {
+            context.push_str("=== SOUL (Agent Identity) ===\n");
+            context.push_str(&soul);
+            context.push_str("\n\n");
+        }
+
+        if let Some(user) = self.read_file_if_exists(&self.user_path()).await? {
+            context.push_str("=== USER (Preferences & Context) ===\n");
+            context.push_str(&user);
+            context.push_str("\n\n");
+        }
+
+        // MEMORY.md — selective loading based on conversation context
+        let memory_content = self.load_memory_selective(recent_messages).await?;
+        if !memory_content.is_empty() {
+            context.push_str("=== MEMORY (Long-Term Knowledge) ===\n");
+            context.push_str(&memory_content);
+            context.push_str("\n\n");
+        }
+
+        if let Some(yesterday) = self.read_file_if_exists(&self.yesterday_note_path()).await? {
+            let date = (Local::now().date_naive() - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
+            context.push_str(&format!("=== Daily Note ({date} — yesterday) ===\n"));
+            context.push_str(&yesterday);
+            context.push_str("\n\n");
+        }
+
+        if let Some(today) = self.read_file_if_exists(&self.today_note_path()).await? {
+            let date = Local::now().date_naive().format("%Y-%m-%d").to_string();
+            context.push_str(&format!("=== Daily Note ({date} — today) ===\n"));
+            context.push_str(&today);
+            context.push_str("\n\n");
+        }
+
+        Ok(context)
+    }
+
+    /// Load MEMORY.md content using selective loading.
+    ///
+    /// Delegates to the growth controller for keyword-based section matching.
+    /// Falls back to full content for small files or legacy format.
+    async fn load_memory_selective(&self, recent_messages: &[String]) -> Result<String> {
+        let gc = self.growth_controller();
+        gc.load_selective(recent_messages).await
     }
 
     // ── Daily notes: append-only log ─────────────────────────────
@@ -315,6 +402,10 @@ impl MarkdownMemory {
         fs::write(&path, &existing)
             .await
             .with_context(|| format!("Failed to write MEMORY.md: {}", path.display()))?;
+
+        // Enforce section size caps after writing
+        let gc = self.growth_controller();
+        gc.enforce_section_caps().await?;
 
         Ok(())
     }

@@ -84,6 +84,25 @@ long_poll_timeout_secs = 30
 # network = false                    # disable network in sandbox
 # mount_paths = []                   # additional read-only mounts
 
+# ── Memory Growth Controls ─────────────────────────────────────────
+#
+# Controls how MEMORY.md grows over time. Prevents unbounded growth
+# through size caps, topic splitting, compaction, and stale entry
+# archival.
+#
+[memory]
+# Maximum size per section in KB. Oldest entries are dropped when exceeded.
+section_max_kb = 2
+
+# Total MEMORY.md size in KB before splitting into topic files.
+total_max_kb = 16
+
+# Compaction triggers at this percentage of total_max_kb (default: 75% = 12KB).
+compact_threshold_pct = 75
+
+# Entries not referenced in this many days are candidates for archival.
+stale_days = 30
+
 # ── Security ─────────────────────────────────────────────────────
 # [security]
 # shell_allowlist = ["git", "cargo", "npm", "ls", "cat", "grep"]
