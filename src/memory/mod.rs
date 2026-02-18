@@ -146,6 +146,7 @@ pub mod markdown;
 pub mod markdown_tools;
 pub mod memory_growth;
 pub mod provider_tools;
+pub mod recursion_guard;
 pub mod sandbox;
 pub mod session;
 pub mod session_tools;

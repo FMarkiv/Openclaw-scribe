@@ -103,6 +103,17 @@ compact_threshold_pct = 75
 # Entries not referenced in this many days are candidates for archival.
 stale_days = 30
 
+# ── Agent Loop ────────────────────────────────────────────────────
+#
+# Controls recursion and loop detection in the agent tool-call loop.
+# The guard detects identical repeated calls, oscillation patterns
+# (A→B→A→B), and memory_store spam.  On detection it injects a
+# warning; if the agent still repeats, the loop is force-stopped.
+#
+# [agent]
+# max_identical_tool_calls = 3   # Warn after N identical calls
+# max_oscillation_depth = 4      # Window for A→B→A→B detection
+
 # ── Security ─────────────────────────────────────────────────────
 # [security]
 # shell_allowlist = ["git", "cargo", "npm", "ls", "cat", "grep"]
