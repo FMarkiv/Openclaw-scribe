@@ -423,6 +423,58 @@ impl MarkdownMemory {
         self.append_daily_note(&entry).await
     }
 
+    // ── Rebuild helpers ───────────────────────────────────────────
+
+    /// Load daily notes spanning a date range (inclusive).
+    ///
+    /// Returns the concatenated content of all daily notes in the range,
+    /// or `None` if no daily notes exist for any date in the range.
+    pub async fn load_daily_notes_range(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Option<String>> {
+        let mut combined = String::new();
+        let mut date = from;
+        while date <= to {
+            let path = self.daily_note_path(date);
+            if let Some(content) = self.read_file_if_exists(&path).await? {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n---\n\n");
+                }
+                combined.push_str(&content);
+            }
+            date += chrono::Duration::days(1);
+        }
+        if combined.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(combined))
+        }
+    }
+
+    /// Load raw sources for a full conversation rebuild.
+    ///
+    /// Returns `(daily_notes_content, memory_content)`. Either may be empty
+    /// if the respective source files don't exist.
+    pub async fn load_rebuild_sources(
+        &self,
+        session_created: NaiveDate,
+    ) -> Result<(String, String)> {
+        let today = Local::now().date_naive();
+        let daily_notes = self
+            .load_daily_notes_range(session_created, today)
+            .await?
+            .unwrap_or_default();
+
+        let memory_content = self
+            .read_file_if_exists(&self.memory_path())
+            .await?
+            .unwrap_or_default();
+
+        Ok((daily_notes, memory_content))
+    }
+
     // ── Utility helpers ──────────────────────────────────────────
 
     /// Read a file if it exists, returning None if it doesn't.
@@ -671,5 +723,60 @@ mod tests {
         let ctx_unnamed = mem.load_session_context().await.unwrap();
         let ctx_none = mem.load_session_context_named(None).await.unwrap();
         assert_eq!(ctx_unnamed, ctx_none);
+    }
+
+    // ── Rebuild source tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn load_daily_notes_range_returns_content() {
+        let (_tmp, mem) = setup().await;
+
+        // Write a note for today
+        mem.append_daily_note("Today's work notes").await.unwrap();
+
+        let today = Local::now().date_naive();
+        let result = mem.load_daily_notes_range(today, today).await.unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Today's work notes"));
+    }
+
+    #[tokio::test]
+    async fn load_daily_notes_range_returns_none_when_empty() {
+        let (_tmp, mem) = setup().await;
+
+        // No notes exist for the range
+        let from = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2020, 1, 3).unwrap();
+        let result = mem.load_daily_notes_range(from, to).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_rebuild_sources_returns_daily_notes_and_memory() {
+        let (_tmp, mem) = setup().await;
+
+        // Write a note for today
+        mem.append_daily_note("Important decision made").await.unwrap();
+
+        let today = Local::now().date_naive();
+        let (daily, memory) = mem.load_rebuild_sources(today).await.unwrap();
+
+        assert!(daily.contains("Important decision made"));
+        assert!(memory.contains("MEMORY")); // from setup
+    }
+
+    #[tokio::test]
+    async fn load_rebuild_sources_handles_missing_daily_notes() {
+        let (_tmp, mem) = setup().await;
+
+        // No daily notes for a past date range
+        let old_date = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let (daily, memory) = mem.load_rebuild_sources(old_date).await.unwrap();
+
+        // daily_notes should still contain today's content (empty since no note for today)
+        // but it should not fail; memory should still have content
+        assert!(memory.contains("MEMORY"));
+        // daily might be empty or contain today's note if it exists
+        let _ = daily; // no panic
     }
 }

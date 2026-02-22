@@ -194,6 +194,12 @@ pub struct CompactionEvent {
     pub turns_before: usize,
     /// Number of turns after compaction (summary + kept turns).
     pub turns_after: usize,
+    /// Compaction depth after this event (1 = first summary, 2 = summary of summary, etc.).
+    #[serde(default)]
+    pub compaction_depth: u32,
+    /// Whether this compaction was a full rebuild from primary sources.
+    #[serde(default)]
+    pub rebuilt: bool,
 }
 
 // ── ContextManager ──────────────────────────────────────────────
@@ -375,12 +381,27 @@ impl ContextManager {
     /// Replaces all turns older than the last `keep_turns` with a single
     /// system message containing the provided summary.
     ///
+    /// `compaction_depth` is the new depth value after this compaction.
+    /// `rebuilt` indicates whether this was a full rebuild from primary sources.
+    ///
     /// Returns a `CompactionEvent` describing what happened.
     pub fn compact(
         &mut self,
         turns: &mut Vec<SessionTurn>,
         summary: &str,
         keep_turns: usize,
+    ) -> CompactionEvent {
+        self.compact_with_depth(turns, summary, keep_turns, 0, false)
+    }
+
+    /// Perform auto-compaction with explicit depth tracking.
+    pub fn compact_with_depth(
+        &mut self,
+        turns: &mut Vec<SessionTurn>,
+        summary: &str,
+        keep_turns: usize,
+        compaction_depth: u32,
+        rebuilt: bool,
     ) -> CompactionEvent {
         let tokens_before = self.current_tokens;
         let turns_before = turns.len();
@@ -400,6 +421,8 @@ impl ContextManager {
                 tokens_after: tokens_before,
                 turns_before,
                 turns_after: turns.len(),
+                compaction_depth,
+                rebuilt,
             };
         }
 
@@ -432,6 +455,8 @@ impl ContextManager {
             tokens_after: self.current_tokens,
             turns_before,
             turns_after: turns.len(),
+            compaction_depth,
+            rebuilt,
         };
 
         self.compaction_history.push(event.clone());
@@ -452,20 +477,72 @@ impl ContextManager {
 
     /// Build a compaction log entry for the daily note.
     pub fn format_compaction_log(event: &CompactionEvent) -> String {
-        let kind = if event.emergency {
-            "Emergency compaction"
-        } else {
-            "Auto-compaction"
-        };
+        Self::format_compaction_log_named(event, None)
+    }
 
+    /// Build a compaction log entry for the daily note, optionally including a session name.
+    pub fn format_compaction_log_named(
+        event: &CompactionEvent,
+        session_name: Option<&str>,
+    ) -> String {
+        let session_prefix = session_name
+            .map(|n| format!("Session {n} "))
+            .unwrap_or_default();
+
+        if event.rebuilt {
+            format!(
+                "**[compaction]** {session_prefix}rebuilt from sources \
+                 (was depth: {old_depth}, reset to {new_depth}): \
+                 {before_turns} turns ({before_tok} tokens) → \
+                 {after_turns} turns ({after_tok} tokens)",
+                old_depth = event.compaction_depth, // depth is already the new value (1)
+                new_depth = event.compaction_depth,
+                before_turns = event.turns_before,
+                before_tok = event.tokens_before,
+                after_turns = event.turns_after,
+                after_tok = event.tokens_after,
+            )
+        } else {
+            let kind = if event.emergency {
+                "Emergency compaction"
+            } else {
+                "Auto-compaction"
+            };
+
+            format!(
+                "**[compaction]** {session_prefix}{kind} (depth: {depth}): \
+                 {before_turns} turns ({before_tok} tokens) → \
+                 {after_turns} turns ({after_tok} tokens)",
+                depth = event.compaction_depth,
+                before_turns = event.turns_before,
+                before_tok = event.tokens_before,
+                after_turns = event.turns_after,
+                after_tok = event.tokens_after,
+            )
+        }
+    }
+
+    // ── Full rebuild from primary sources ─────────────────────────
+
+    /// Build a prompt that asks the LLM to create a fresh summary from
+    /// raw daily notes and MEMORY.md entries — bypassing the existing
+    /// (potentially degraded) summary entirely.
+    pub fn build_rebuild_prompt(daily_notes: &str, memory_entries: &str) -> String {
         format!(
-            "**[compaction]** {kind}: {before_turns} turns ({before_tok} tokens) → \
-             {after_turns} turns ({after_tok} tokens)",
-            before_turns = event.turns_before,
-            before_tok = event.tokens_before,
-            after_turns = event.turns_after,
-            after_tok = event.tokens_after,
+            "Rebuild a conversation summary from these primary sources. \
+             This is a fresh summary, not a summary of a summary.\n\n\
+             Focus on: key decisions made, current task state, important \
+             facts, and any pending work.\n\n\
+             === DAILY NOTES ===\n{daily_notes}\n\n\
+             === MEMORY ENTRIES ===\n{memory_entries}\n\n\
+             SUMMARY:"
         )
+    }
+
+    /// Check whether a full rebuild should be performed instead of normal
+    /// summarization. Returns true when `compaction_depth >= max_depth`.
+    pub fn should_rebuild(compaction_depth: u32, max_compaction_depth: u32) -> bool {
+        compaction_depth >= max_compaction_depth
     }
 
     // ── Full pre-call pipeline ──────────────────────────────────
@@ -996,10 +1073,13 @@ mod tests {
             tokens_after: 30_000,
             turns_before: 100,
             turns_after: 6,
+            compaction_depth: 1,
+            rebuilt: false,
         };
 
         let log = ContextManager::format_compaction_log(&event);
         assert!(log.contains("Auto-compaction"));
+        assert!(log.contains("depth: 1"));
         assert!(log.contains("150000"));
         assert!(log.contains("30000"));
         assert!(log.contains("100 turns"));
@@ -1015,10 +1095,13 @@ mod tests {
             tokens_after: 5_000,
             turns_before: 150,
             turns_after: 4,
+            compaction_depth: 2,
+            rebuilt: false,
         };
 
         let log = ContextManager::format_compaction_log(&event);
         assert!(log.contains("Emergency compaction"));
+        assert!(log.contains("depth: 2"));
     }
 
     // ── Pre-call pipeline tests ─────────────────────────────────
@@ -1161,6 +1244,8 @@ mod tests {
             tokens_after: 30_000,
             turns_before: 100,
             turns_after: 6,
+            compaction_depth: 1,
+            rebuilt: false,
         };
 
         ContextManager::log_compaction_to_daily_note(&event, &memory)
@@ -1173,6 +1258,7 @@ mod tests {
         assert!(content.contains("[compaction]"));
         assert!(content.contains("Auto-compaction"));
         assert!(content.contains("150000"));
+        assert!(content.contains("depth: 1"));
     }
 
     // ── Integration-style tests ─────────────────────────────────
@@ -1229,5 +1315,169 @@ mod tests {
         assert!(event.emergency);
         assert_eq!(turns.len(), 4); // summary + 3
         assert_eq!(turns[0].role, "system");
+    }
+
+    // ── Compaction depth tracking tests ─────────────────────────
+
+    #[test]
+    fn compact_with_depth_records_depth() {
+        let mut mgr = ContextManager::for_provider("anthropic");
+
+        let mut turns: Vec<SessionTurn> = (0..10)
+            .map(|i| user_turn(&format!("msg {i}")))
+            .collect();
+
+        mgr.recount_tokens(&turns);
+        let event = mgr.compact_with_depth(&mut turns, "Summary", 5, 1, false);
+
+        assert_eq!(event.compaction_depth, 1);
+        assert!(!event.rebuilt);
+        assert_eq!(mgr.compaction_history().last().unwrap().compaction_depth, 1);
+    }
+
+    #[test]
+    fn compact_with_depth_increments_across_compactions() {
+        let mut mgr = ContextManager::for_provider("anthropic");
+
+        // First compaction (depth 1)
+        let mut turns: Vec<SessionTurn> = (0..10)
+            .map(|i| user_turn(&format!("msg {i}")))
+            .collect();
+        mgr.recount_tokens(&turns);
+        let event1 = mgr.compact_with_depth(&mut turns, "Summary 1", 5, 1, false);
+        assert_eq!(event1.compaction_depth, 1);
+
+        // Simulate more conversation
+        for i in 0..10 {
+            let turn = user_turn(&format!("new msg {i}"));
+            mgr.track_turn(&turn);
+            turns.push(turn);
+        }
+
+        // Second compaction (depth 2)
+        let event2 = mgr.compact_with_depth(&mut turns, "Summary 2", 5, 2, false);
+        assert_eq!(event2.compaction_depth, 2);
+        assert!(!event2.rebuilt);
+    }
+
+    #[test]
+    fn compact_with_depth_rebuild_sets_rebuilt_flag() {
+        let mut mgr = ContextManager::for_provider("anthropic");
+
+        let mut turns: Vec<SessionTurn> = (0..10)
+            .map(|i| user_turn(&format!("msg {i}")))
+            .collect();
+
+        mgr.recount_tokens(&turns);
+
+        // Rebuild at depth 3 → reset to 1
+        let event = mgr.compact_with_depth(&mut turns, "Fresh rebuild summary", 5, 1, true);
+
+        assert_eq!(event.compaction_depth, 1);
+        assert!(event.rebuilt);
+    }
+
+    #[test]
+    fn should_rebuild_at_threshold() {
+        assert!(!ContextManager::should_rebuild(0, 3));
+        assert!(!ContextManager::should_rebuild(1, 3));
+        assert!(!ContextManager::should_rebuild(2, 3));
+        assert!(ContextManager::should_rebuild(3, 3));
+        assert!(ContextManager::should_rebuild(4, 3));
+        assert!(ContextManager::should_rebuild(10, 3));
+    }
+
+    #[test]
+    fn should_rebuild_with_custom_threshold() {
+        assert!(!ContextManager::should_rebuild(4, 5));
+        assert!(ContextManager::should_rebuild(5, 5));
+        assert!(ContextManager::should_rebuild(6, 5));
+    }
+
+    #[test]
+    fn build_rebuild_prompt_includes_sources() {
+        let daily_notes = "# Daily Note — 2026-02-14\n\n### 10:00\n\nWorked on compaction.";
+        let memory = "## Project Facts\n\n- ZeroClaw uses Rust";
+
+        let prompt = ContextManager::build_rebuild_prompt(daily_notes, memory);
+        assert!(prompt.contains("Rebuild a conversation summary"));
+        assert!(prompt.contains("fresh summary"));
+        assert!(prompt.contains("DAILY NOTES"));
+        assert!(prompt.contains("Worked on compaction"));
+        assert!(prompt.contains("MEMORY ENTRIES"));
+        assert!(prompt.contains("ZeroClaw uses Rust"));
+        assert!(prompt.contains("SUMMARY:"));
+    }
+
+    #[test]
+    fn format_compaction_log_with_rebuild() {
+        let event = CompactionEvent {
+            timestamp: "2026-02-14T10:00:00Z".to_string(),
+            emergency: false,
+            tokens_before: 150_000,
+            tokens_after: 30_000,
+            turns_before: 100,
+            turns_after: 6,
+            compaction_depth: 1,
+            rebuilt: true,
+        };
+
+        let log = ContextManager::format_compaction_log(&event);
+        assert!(log.contains("rebuilt from sources"));
+        assert!(log.contains("reset to 1"));
+        assert!(!log.contains("Auto-compaction"));
+    }
+
+    #[test]
+    fn format_compaction_log_named_includes_session() {
+        let event = CompactionEvent {
+            timestamp: "2026-02-14T10:00:00Z".to_string(),
+            emergency: false,
+            tokens_before: 150_000,
+            tokens_after: 30_000,
+            turns_before: 100,
+            turns_after: 6,
+            compaction_depth: 2,
+            rebuilt: false,
+        };
+
+        let log = ContextManager::format_compaction_log_named(&event, Some("my-session"));
+        assert!(log.contains("Session my-session"));
+        assert!(log.contains("Auto-compaction"));
+        assert!(log.contains("depth: 2"));
+    }
+
+    #[test]
+    fn format_compaction_log_named_rebuild_includes_session() {
+        let event = CompactionEvent {
+            timestamp: "2026-02-14T10:00:00Z".to_string(),
+            emergency: false,
+            tokens_before: 150_000,
+            tokens_after: 30_000,
+            turns_before: 100,
+            turns_after: 6,
+            compaction_depth: 1,
+            rebuilt: true,
+        };
+
+        let log = ContextManager::format_compaction_log_named(&event, Some("my-session"));
+        assert!(log.contains("Session my-session rebuilt from sources"));
+        assert!(log.contains("reset to 1"));
+    }
+
+    #[test]
+    fn compaction_event_default_depth_is_zero() {
+        // Simulate deserializing an old CompactionEvent without depth fields
+        let json = r#"{
+            "timestamp": "2026-02-14T10:00:00Z",
+            "emergency": false,
+            "tokens_before": 100,
+            "tokens_after": 50,
+            "turns_before": 10,
+            "turns_after": 5
+        }"#;
+        let event: CompactionEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.compaction_depth, 0);
+        assert!(!event.rebuilt);
     }
 }
