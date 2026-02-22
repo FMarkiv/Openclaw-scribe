@@ -1,0 +1,59 @@
+#!/bin/sh
+# power_save — Enter power-saving mode (CPU powersave + WiFi PM on)
+# Part of the power-mgmt skill for Openclaw-Scribe
+# Requires: sudo, cpufrequtils, wireless-tools
+
+set -e
+
+echo "=== Entering Power Save Mode ==="
+echo ""
+
+ERRORS=0
+
+# --- CPU Governor → powersave ---
+if command -v cpufreq-set >/dev/null 2>&1; then
+    echo "Setting CPU governor to powersave..."
+    if sudo cpufreq-set -g powersave 2>&1; then
+        echo "  OK: CPU governor set to powersave"
+    else
+        echo "  WARN: cpufreq-set failed (are you root?)"
+        ERRORS=$((ERRORS + 1))
+    fi
+else
+    echo "  SKIP: cpufreq-set not found"
+    echo "  Install with: sudo apt install cpufrequtils"
+    ERRORS=$((ERRORS + 1))
+fi
+
+echo ""
+
+# --- WiFi Power Management → on ---
+if command -v iwconfig >/dev/null 2>&1; then
+    echo "Enabling WiFi power management..."
+    if sudo iwconfig wlan0 power on 2>&1; then
+        echo "  OK: WiFi power management enabled"
+    else
+        echo "  WARN: iwconfig failed (wlan0 missing or no permissions)"
+        ERRORS=$((ERRORS + 1))
+    fi
+else
+    echo "  SKIP: iwconfig not found"
+    echo "  Install with: sudo apt install wireless-tools"
+    ERRORS=$((ERRORS + 1))
+fi
+
+echo ""
+
+# --- Write power state flag ---
+mkdir -p "$HOME/.zeroclaw"
+echo "saving" > "$HOME/.zeroclaw/power_state"
+echo "Power state flag set to: saving"
+echo "  (Telegram poll interval will be reduced on next check)"
+
+echo ""
+if [ "$ERRORS" -eq 0 ]; then
+    echo "Power save mode ACTIVE."
+else
+    echo "Power save mode PARTIAL ($ERRORS component(s) skipped)."
+    echo "Check warnings above for missing packages."
+fi

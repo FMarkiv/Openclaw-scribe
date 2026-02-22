@@ -1,0 +1,59 @@
+#!/bin/sh
+# power_wake — Exit power-saving mode (CPU ondemand + WiFi PM off)
+# Part of the power-mgmt skill for Openclaw-Scribe
+# Requires: sudo, cpufrequtils, wireless-tools
+
+set -e
+
+echo "=== Waking Up — Restoring Full Power ==="
+echo ""
+
+ERRORS=0
+
+# --- CPU Governor → ondemand ---
+if command -v cpufreq-set >/dev/null 2>&1; then
+    echo "Setting CPU governor to ondemand..."
+    if sudo cpufreq-set -g ondemand 2>&1; then
+        echo "  OK: CPU governor set to ondemand"
+    else
+        echo "  WARN: cpufreq-set failed (are you root?)"
+        ERRORS=$((ERRORS + 1))
+    fi
+else
+    echo "  SKIP: cpufreq-set not found"
+    echo "  Install with: sudo apt install cpufrequtils"
+    ERRORS=$((ERRORS + 1))
+fi
+
+echo ""
+
+# --- WiFi Power Management → off ---
+if command -v iwconfig >/dev/null 2>&1; then
+    echo "Disabling WiFi power management..."
+    if sudo iwconfig wlan0 power off 2>&1; then
+        echo "  OK: WiFi power management disabled"
+    else
+        echo "  WARN: iwconfig failed (wlan0 missing or no permissions)"
+        ERRORS=$((ERRORS + 1))
+    fi
+else
+    echo "  SKIP: iwconfig not found"
+    echo "  Install with: sudo apt install wireless-tools"
+    ERRORS=$((ERRORS + 1))
+fi
+
+echo ""
+
+# --- Write power state flag ---
+mkdir -p "$HOME/.zeroclaw"
+echo "active" > "$HOME/.zeroclaw/power_state"
+echo "Power state flag set to: active"
+echo "  (Telegram poll interval restored to normal)"
+
+echo ""
+if [ "$ERRORS" -eq 0 ]; then
+    echo "Full power RESTORED."
+else
+    echo "Wake PARTIAL ($ERRORS component(s) skipped)."
+    echo "Check warnings above for missing packages."
+fi
