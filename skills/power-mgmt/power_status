@@ -1,0 +1,68 @@
+#!/bin/sh
+# power_status — Report current CPU and WiFi power management state
+# Part of the power-mgmt skill for Openclaw-Scribe
+
+set -e
+
+echo "=== Power Status ==="
+echo ""
+
+# --- CPU Governor ---
+GOVERNOR_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+if [ -f "$GOVERNOR_PATH" ]; then
+    GOVERNOR=$(cat "$GOVERNOR_PATH")
+    echo "CPU governor: $GOVERNOR"
+else
+    GOVERNOR="unknown"
+    echo "CPU governor: unavailable (no cpufreq sysfs)"
+fi
+
+# --- CPU Frequency ---
+FREQ_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+if [ -f "$FREQ_PATH" ]; then
+    FREQ_KHZ=$(cat "$FREQ_PATH")
+    FREQ_MHZ=$((FREQ_KHZ / 1000))
+    echo "CPU frequency: ${FREQ_MHZ} MHz"
+else
+    echo "CPU frequency: unavailable"
+fi
+
+echo ""
+
+# --- WiFi Power Management ---
+if command -v iwconfig >/dev/null 2>&1; then
+    WIFI_PM=$(iwconfig wlan0 2>/dev/null | grep "Power Management" || true)
+    if [ -n "$WIFI_PM" ]; then
+        echo "WiFi power mgmt:$WIFI_PM"
+    else
+        echo "WiFi power mgmt: unavailable (wlan0 not found or no data)"
+    fi
+else
+    echo "WiFi power mgmt: unavailable (iwconfig not found — install wireless-tools)"
+fi
+
+echo ""
+
+# --- Power State Flag ---
+STATE_FILE="$HOME/.zeroclaw/power_state"
+if [ -f "$STATE_FILE" ]; then
+    STATE=$(cat "$STATE_FILE")
+    echo "Power state flag: $STATE"
+else
+    echo "Power state flag: not set (default: active)"
+    STATE="active"
+fi
+
+echo ""
+
+# --- Estimated Power State ---
+echo -n "Estimated state: "
+if [ "$STATE" = "saving" ] || [ "$STATE" = "deep_sleep" ]; then
+    echo "$STATE"
+elif [ "$GOVERNOR" = "powersave" ]; then
+    echo "saving (governor is powersave)"
+elif [ "$GOVERNOR" = "ondemand" ] || [ "$GOVERNOR" = "schedutil" ] || [ "$GOVERNOR" = "performance" ]; then
+    echo "active"
+else
+    echo "unknown"
+fi

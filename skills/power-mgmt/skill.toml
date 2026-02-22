@@ -1,0 +1,4 @@
+name = "power-mgmt"
+description = "CPU and WiFi power management for battery life"
+version = "0.1.0"
+tools = ["power_status", "power_save", "power_wake"]
