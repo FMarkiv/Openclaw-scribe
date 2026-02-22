@@ -31,12 +31,22 @@ pub struct MemoryConfig {
     /// Days without reference before an entry is considered stale (default: 30).
     #[serde(default = "default_stale_days")]
     pub stale_days: usize,
+    /// Enable LLM-based semantic search as Phase 2 of memory recall (default: true).
+    /// When enabled, keyword grep results are scored by an LLM for relevance.
+    /// Note: scoring calls count toward normal API usage/billing.
+    #[serde(default = "default_semantic_search")]
+    pub semantic_search: bool,
+    /// Model to use for semantic scoring (default: "" = use primary model).
+    /// Set to a specific model name to use a cheaper/faster model for scoring.
+    #[serde(default)]
+    pub scoring_model: String,
 }
 
 fn default_section_max_kb() -> usize { 2 }
 fn default_total_max_kb() -> usize { 16 }
 fn default_compact_threshold_pct() -> usize { 75 }
 fn default_stale_days() -> usize { 30 }
+fn default_semantic_search() -> bool { true }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -45,6 +55,8 @@ impl Default for MemoryConfig {
             total_max_kb: default_total_max_kb(),
             compact_threshold_pct: default_compact_threshold_pct(),
             stale_days: default_stale_days(),
+            semantic_search: default_semantic_search(),
+            scoring_model: String::new(),
         }
     }
 }
@@ -893,7 +905,7 @@ fn slugify(name: &str) -> String {
 }
 
 /// Extract keywords from recent messages for section matching.
-fn extract_keywords(messages: &[String]) -> Vec<String> {
+pub fn extract_keywords(messages: &[String]) -> Vec<String> {
     let stop_words = [
         "the", "a", "an", "is", "are", "was", "were", "be", "been",
         "being", "have", "has", "had", "do", "does", "did", "will",
@@ -1389,6 +1401,8 @@ mod tests {
         assert_eq!(config.total_max_kb, 16);
         assert_eq!(config.compact_threshold_pct, 75);
         assert_eq!(config.stale_days, 30);
+        assert!(config.semantic_search);
+        assert!(config.scoring_model.is_empty());
         assert_eq!(config.section_max_bytes(), 2048);
         assert_eq!(config.total_max_bytes(), 16384);
         assert_eq!(config.compact_threshold_bytes(), 12288);
@@ -1420,5 +1434,28 @@ mod tests {
         assert_eq!(config.total_max_kb, 16); // default
         assert_eq!(config.compact_threshold_pct, 75); // default
         assert_eq!(config.stale_days, 30); // default
+        assert!(config.semantic_search); // default true
+        assert!(config.scoring_model.is_empty()); // default empty
+    }
+
+    #[test]
+    fn test_memory_config_semantic_search_fields() {
+        let toml_str = r#"
+            semantic_search = false
+            scoring_model = "claude-haiku-3"
+        "#;
+        let config: MemoryConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.semantic_search);
+        assert_eq!(config.scoring_model, "claude-haiku-3");
+    }
+
+    #[test]
+    fn test_memory_config_semantic_search_default_enabled() {
+        // When not specified, semantic_search defaults to true
+        let toml_str = r#"
+            section_max_kb = 2
+        "#;
+        let config: MemoryConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.semantic_search);
     }
 }

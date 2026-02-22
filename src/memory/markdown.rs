@@ -475,6 +475,38 @@ impl MarkdownMemory {
         Ok((daily_notes, memory_content))
     }
 
+    // ── Manifest / topic helpers for semantic search ────────────
+
+    /// Load the MEMORY.md manifest section ("Archived Topics") as text.
+    ///
+    /// Returns the manifest content or an empty string if no manifest exists.
+    /// Used by Phase 2 semantic search when keyword grep returns no results.
+    pub async fn load_manifest(&self) -> Result<String> {
+        let content = match self.read_file_if_exists(&self.memory_path()).await? {
+            Some(c) => c,
+            None => return Ok(String::new()),
+        };
+
+        let (_, sections) = crate::memory::memory_growth::parse_memory_content(&content);
+        for section in &sections {
+            if section.name == "Archived Topics" {
+                return Ok(section.to_markdown());
+            }
+        }
+
+        // No manifest section — return full index content (capped)
+        // for small MEMORY.md files that haven't been split yet
+        Ok(content)
+    }
+
+    /// Load the contents of a specific topic file from the memory/ directory.
+    ///
+    /// `topic_file` is the filename (e.g., "docker-setup.md").
+    pub async fn load_topic_file(&self, topic_file: &str) -> Result<Option<String>> {
+        let path = self.daily_dir().join(topic_file);
+        self.read_file_if_exists(&path).await
+    }
+
     // ── Utility helpers ──────────────────────────────────────────
 
     /// Read a file if it exists, returning None if it doesn't.

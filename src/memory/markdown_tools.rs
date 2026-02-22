@@ -11,6 +11,7 @@
 
 use crate::memory::markdown::MarkdownMemory;
 use crate::memory::memory_growth::parse_memory_content;
+use crate::memory::semantic_search::SemanticScorer;
 use crate::tools::{Tool, ToolExecutionResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -97,16 +98,34 @@ impl Tool for MemoryStoreTool {
 
 /// Tool: Search across all markdown memory files.
 ///
-/// Performs case-insensitive substring search across MEMORY.md,
-/// all daily notes, SOUL.md, and USER.md. Returns matching lines
-/// with context.
+/// Performs a two-phase search:
+/// - **Phase 1** (keyword grep): case-insensitive substring search across
+///   MEMORY.md, daily notes, SOUL.md, USER.md.
+/// - **Phase 2** (semantic scoring): if enabled, sends Phase 1 results to
+///   an LLM for relevance scoring (0-10). Only entries scoring 7+ are returned.
+///
+/// Phase 2 is skipped when: semantic search is disabled, there are 1-2 exact
+/// token matches, or the scoring API fails (graceful degradation to Phase 1).
 pub struct MemoryRecallTool {
     memory: Arc<MarkdownMemory>,
+    /// Optional semantic scorer for Phase 2 LLM-based relevance scoring.
+    scorer: Option<Arc<SemanticScorer>>,
 }
 
 impl MemoryRecallTool {
     pub fn new(memory: Arc<MarkdownMemory>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            scorer: None,
+        }
+    }
+
+    /// Create a MemoryRecallTool with semantic scoring enabled.
+    pub fn with_scorer(memory: Arc<MarkdownMemory>, scorer: Arc<SemanticScorer>) -> Self {
+        Self {
+            memory,
+            scorer: Some(scorer),
+        }
     }
 
     /// Update the reference tracker for entries matching a query.
@@ -133,6 +152,142 @@ impl MemoryRecallTool {
         gc.save_refs(&tracker).await?;
 
         Ok(())
+    }
+
+    /// Update the reference tracker for specific entry texts returned by Phase 2.
+    async fn touch_scored_entries(&self, entry_texts: &[String]) -> Result<()> {
+        let gc = self.memory.growth_controller();
+        let mut tracker = gc.load_refs().await?;
+        for text in entry_texts {
+            tracker.touch(text);
+        }
+        gc.save_refs(&tracker).await?;
+        Ok(())
+    }
+
+    /// Run Phase 2 semantic scoring on keyword grep results.
+    ///
+    /// Returns the formatted output with scored results, or None to fall
+    /// back to Phase 1 results.
+    async fn run_phase2_on_results(
+        &self,
+        query: &str,
+        results: &[crate::memory::markdown::MarkdownSearchResult],
+    ) -> Option<String> {
+        let scorer = self.scorer.as_ref()?;
+        if !scorer.is_enabled() {
+            return None;
+        }
+
+        // Check if Phase 2 should be skipped (exact match optimization)
+        let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        if SemanticScorer::should_skip_phase2(query, &contents) {
+            return None;
+        }
+
+        // Build entries text from Phase 1 results
+        let entries_text: String = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("[{}] ({}:L{}) {}", i + 1, r.source, r.line_number, r.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Score via LLM
+        let scored = scorer.score_entries(query, &entries_text).await?;
+        if scored.is_empty() {
+            return None;
+        }
+
+        // Update reference tracker for scored entries
+        let scored_texts: Vec<String> = scored.iter().map(|s| s.entry.clone()).collect();
+        if let Err(e) = self.touch_scored_entries(&scored_texts).await {
+            eprintln!("[memory_recall] Failed to update reference tracker for scored entries: {e}");
+        }
+
+        // Format scored results
+        let mut output = format!(
+            "Found {} semantically relevant match(es) for \"{query}\" (scored 7+/10):\n\n",
+            scored.len()
+        );
+        for (i, entry) in scored.iter().enumerate() {
+            output.push_str(&format!(
+                "--- Match {} (score: {}/10) ---\n{}\n\n",
+                i + 1,
+                entry.score,
+                entry.entry
+            ));
+        }
+        Some(output)
+    }
+
+    /// Run Phase 2 manifest-based search when keyword grep returns nothing.
+    ///
+    /// Sends the MEMORY.md manifest to the LLM to identify relevant topics,
+    /// then loads and scores those topic files.
+    async fn run_phase2_manifest_fallback(&self, query: &str) -> Option<String> {
+        let scorer = self.scorer.as_ref()?;
+        if !scorer.is_enabled() {
+            return None;
+        }
+
+        // Load the manifest/index from MEMORY.md
+        let manifest = self.memory.load_manifest().await.ok()?;
+        if manifest.is_empty() {
+            return None;
+        }
+
+        // Ask LLM to identify relevant topics from the manifest
+        let relevant_topics = scorer.identify_relevant_topics(query, &manifest).await?;
+        if relevant_topics.is_empty() {
+            return None;
+        }
+
+        // For each relevant topic, try to load its file and score entries
+        let mut all_topic_entries = String::new();
+        for topic in &relevant_topics {
+            // The "entry" field from manifest scoring might contain the filename
+            // Try to extract it
+            let topic_file = extract_topic_filename(&topic.entry);
+            if let Some(filename) = topic_file {
+                if let Ok(Some(content)) = self.memory.load_topic_file(&filename).await {
+                    if !all_topic_entries.is_empty() {
+                        all_topic_entries.push('\n');
+                    }
+                    all_topic_entries.push_str(&content);
+                }
+            }
+        }
+
+        if all_topic_entries.is_empty() {
+            return None;
+        }
+
+        // Score the topic file entries
+        let scored = scorer.score_entries(query, &all_topic_entries).await?;
+        if scored.is_empty() {
+            return None;
+        }
+
+        // Update reference tracker for scored entries
+        let scored_texts: Vec<String> = scored.iter().map(|s| s.entry.clone()).collect();
+        if let Err(e) = self.touch_scored_entries(&scored_texts).await {
+            eprintln!("[memory_recall] Failed to update reference tracker for scored entries: {e}");
+        }
+
+        let mut output = format!(
+            "Found {} semantically relevant match(es) for \"{query}\" from archived topics (scored 7+/10):\n\n",
+            scored.len()
+        );
+        for (i, entry) in scored.iter().enumerate() {
+            output.push_str(&format!(
+                "--- Match {} (score: {}/10) ---\n{}\n\n",
+                i + 1,
+                entry.score,
+                entry.entry
+            ));
+        }
+        Some(output)
     }
 }
 
@@ -176,20 +331,41 @@ impl Tool for MemoryRecallTool {
             });
         }
 
+        // ── Phase 1: Keyword grep ────────────────────────────────
         match self.memory.search(&query).await {
             Ok(results) => {
-                // Track references for stale entry scoring
+                // Track references for stale entry scoring (Phase 1)
                 if let Err(e) = self.touch_matching_entries(&query).await {
                     eprintln!("[memory_recall] Failed to update reference tracker: {e}");
                 }
 
                 if results.is_empty() {
+                    // Phase 1 returned nothing — try Phase 2 manifest fallback
+                    if let Some(phase2_output) = self.run_phase2_manifest_fallback(&query).await {
+                        return Ok(ToolExecutionResult {
+                            success: true,
+                            output: phase2_output,
+                            error: None,
+                        });
+                    }
                     Ok(ToolExecutionResult {
                         success: true,
                         output: format!("No matches found for: \"{query}\""),
                         error: None,
                     })
                 } else {
+                    // ── Phase 2: Semantic scoring (if enabled) ───
+                    // Try Phase 2 scoring on keyword grep results.
+                    // Falls back to Phase 1 results on failure.
+                    if let Some(phase2_output) = self.run_phase2_on_results(&query, &results).await {
+                        return Ok(ToolExecutionResult {
+                            success: true,
+                            output: phase2_output,
+                            error: None,
+                        });
+                    }
+
+                    // Phase 2 skipped or failed — return Phase 1 results
                     let mut output = format!("Found {} match(es) for \"{query}\":\n\n", results.len());
                     for (i, result) in results.iter().enumerate() {
                         output.push_str(&format!(
@@ -385,15 +561,45 @@ impl Tool for MemoryPromoteTool {
 /// ```rust
 /// let md_mem = Arc::new(MarkdownMemory::new(&config.workspace));
 /// let mut tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
-/// tools.extend(markdown_tools::all_markdown_tools(md_mem));
+/// tools.extend(markdown_tools::all_markdown_tools(md_mem, None));
 /// ```
-pub fn all_markdown_tools(memory: Arc<MarkdownMemory>) -> Vec<Box<dyn Tool>> {
+pub fn all_markdown_tools(
+    memory: Arc<MarkdownMemory>,
+    scorer: Option<Arc<SemanticScorer>>,
+) -> Vec<Box<dyn Tool>> {
+    let recall_tool: Box<dyn Tool> = match scorer {
+        Some(s) => Box::new(MemoryRecallTool::with_scorer(memory.clone(), s)),
+        None => Box::new(MemoryRecallTool::new(memory.clone())),
+    };
     vec![
         Box::new(MemoryStoreTool::new(memory.clone())),
-        Box::new(MemoryRecallTool::new(memory.clone())),
+        recall_tool,
         Box::new(MemoryFlushTool::new(memory.clone())),
         Box::new(MemoryPromoteTool::new(memory)),
     ]
+}
+
+/// Extract a topic filename from a manifest entry string.
+///
+/// Manifest entries look like: `**filename.md** (N entries): summary`
+/// This extracts the filename portion.
+fn extract_topic_filename(entry: &str) -> Option<String> {
+    // Try to find **filename.md** pattern
+    if let Some(start) = entry.find("**") {
+        let rest = &entry[start + 2..];
+        if let Some(end) = rest.find("**") {
+            let filename = &rest[..end];
+            if filename.ends_with(".md") {
+                return Some(filename.to_string());
+            }
+        }
+    }
+    // Fall back: if the entry itself looks like a filename
+    let trimmed = entry.trim();
+    if trimmed.ends_with(".md") && !trimmed.contains(' ') {
+        return Some(trimmed.to_string());
+    }
+    None
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -515,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn all_markdown_tools_returns_four_tools() {
         let (_tmp, mem) = setup().await;
-        let tools = all_markdown_tools(mem);
+        let tools = all_markdown_tools(mem, None);
         assert_eq!(tools.len(), 4);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -523,5 +729,83 @@ mod tests {
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"memory_flush"));
         assert!(names.contains(&"memory_promote"));
+    }
+
+    #[tokio::test]
+    async fn all_markdown_tools_with_scorer_returns_four_tools() {
+        let (_tmp, mem) = setup().await;
+        let scorer = Arc::new(SemanticScorer::new(
+            crate::memory::semantic_search::SemanticSearchConfig {
+                enabled: true,
+                scoring_model: String::new(),
+                provider: "anthropic".to_string(),
+                primary_model: "claude-sonnet-4-20250514".to_string(),
+                api_key: "test".to_string(),
+                api_base_url: None,
+            },
+        ));
+        let tools = all_markdown_tools(mem, Some(scorer));
+        assert_eq!(tools.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn memory_recall_without_scorer_returns_phase1_results() {
+        let (_tmp, mem) = setup().await;
+        mem.append_daily_note("Docker sandbox is configured")
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query": "Docker"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Docker"));
+        // Should be Phase 1 format (no score mentions)
+        assert!(!result.output.contains("score:"));
+    }
+
+    #[tokio::test]
+    async fn memory_recall_with_disabled_scorer_returns_phase1() {
+        let (_tmp, mem) = setup().await;
+        mem.append_daily_note("Docker sandbox is configured")
+            .await
+            .unwrap();
+
+        let scorer = Arc::new(SemanticScorer::new(
+            crate::memory::semantic_search::SemanticSearchConfig {
+                enabled: false,
+                scoring_model: String::new(),
+                provider: "anthropic".to_string(),
+                primary_model: "claude-sonnet-4-20250514".to_string(),
+                api_key: "test".to_string(),
+                api_base_url: None,
+            },
+        ));
+        let tool = MemoryRecallTool::with_scorer(mem, scorer);
+        let result = tool.execute(json!({"query": "Docker"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Docker"));
+        // Disabled scorer should fall back to Phase 1
+        assert!(!result.output.contains("score:"));
+    }
+
+    #[test]
+    fn test_extract_topic_filename_markdown_bold() {
+        assert_eq!(
+            extract_topic_filename("**docker-setup.md** (5 entries): Docker configuration"),
+            Some("docker-setup.md".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_topic_filename_plain() {
+        assert_eq!(
+            extract_topic_filename("docker-setup.md"),
+            Some("docker-setup.md".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_topic_filename_no_match() {
+        assert_eq!(extract_topic_filename("just some text"), None);
     }
 }
