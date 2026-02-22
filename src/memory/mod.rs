@@ -152,6 +152,7 @@ pub mod session;
 pub mod session_tools;
 pub mod silent;
 pub mod startup;
+pub mod structured_log;
 pub mod subagent;
 pub mod telegram;
 pub mod telegram_rich;

@@ -103,6 +103,28 @@ compact_threshold_pct = 75
 # Entries not referenced in this many days are candidates for archival.
 stale_days = 30
 
+# ── Structured Logging ─────────────────────────────────────────────
+#
+# Structured JSON logging writes one JSON object per line to a daily
+# log file at log_dir/YYYY-MM-DD.jsonl.  Human-readable stderr output
+# continues unchanged — this is purely additive.
+#
+# Each event includes: timestamp, loop_id, turn_number, event_type,
+# provider, model, duration_ms, token counts, tool_name, detail, level.
+#
+# Log files older than retain_days are deleted on startup (best-effort).
+#
+# Use /logs to query structured logs:
+#   /logs              — last 20 entries
+#   /logs 50           — last 50 entries
+#   /logs 20 error     — last 20 error events
+#   /logs failover     — last 20 failover events
+#
+[logging]
+structured = true
+log_dir = "~/.zeroclaw/logs"
+retain_days = 14
+
 # ── Agent Loop ────────────────────────────────────────────────────
 #
 # Controls recursion and loop detection in the agent tool-call loop.
