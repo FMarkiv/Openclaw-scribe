@@ -14,6 +14,7 @@
 //! resumed. Named sessions can be created, switched, renamed, and
 //! listed via local commands.
 
+use crate::memory::context_meter::ContextMeter;
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,11 @@ pub struct SessionMeta {
     /// Missing field in existing session files defaults to 0.
     #[serde(default)]
     pub compaction_depth: u32,
+    /// Persistent context window usage tracker.
+    /// Tracks API-reported token counts, rolling averages, and compaction state.
+    /// Missing field in existing session files defaults to a zeroed meter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_meter: Option<ContextMeter>,
 }
 
 /// Information about a session for listing purposes.
@@ -258,6 +264,7 @@ impl SessionManager {
             provider: None,
             model: None,
             compaction_depth: 0,
+            context_meter: None,
         };
         self.write_meta(&slug, &meta).await?;
 
@@ -645,6 +652,7 @@ impl SessionManager {
                     provider: None,
                     model: None,
                     compaction_depth: 0,
+                    context_meter: None,
                 };
                 self.write_meta(name, &meta).await
             }
@@ -682,6 +690,7 @@ impl SessionManager {
                 provider: None,
                 model: None,
                 compaction_depth: 0,
+                context_meter: None,
             }
         });
         meta.compaction_depth = depth;
@@ -694,6 +703,44 @@ impl SessionManager {
         let new_depth = current + 1;
         self.set_compaction_depth(new_depth).await?;
         Ok(new_depth)
+    }
+
+    // ── Context meter persistence ────────────────────────────────
+
+    /// Save a ContextMeter snapshot to the active session metadata.
+    ///
+    /// Called after every LLM response to persist usage stats.
+    pub async fn save_context_meter(&self, meter: &ContextMeter) -> Result<()> {
+        let name = self
+            .session_name
+            .as_ref()
+            .context("No active session")?
+            .clone();
+        let mut meta = self.read_meta(&name).await.unwrap_or_else(|_| {
+            let now = Local::now().to_rfc3339();
+            SessionMeta {
+                name: name.clone(),
+                created_at: now.clone(),
+                last_active: now,
+                provider: None,
+                model: None,
+                compaction_depth: 0,
+                context_meter: None,
+            }
+        });
+        meta.context_meter = Some(meter.clone());
+        self.write_meta(&name, &meta).await
+    }
+
+    /// Load the ContextMeter from the active session metadata.
+    ///
+    /// Returns `None` if no meter data exists (backward-compatible sessions).
+    pub async fn load_context_meter(&self) -> Option<ContextMeter> {
+        let name = self.session_name.as_ref()?;
+        self.read_meta(name)
+            .await
+            .ok()
+            .and_then(|meta| meta.context_meter)
     }
 
     // ── Internal helpers ─────────────────────────────────────────

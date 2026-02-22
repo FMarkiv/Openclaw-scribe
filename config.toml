@@ -146,6 +146,22 @@ retain_days = 14
 # shell_allowlist = ["git", "cargo", "npm", "ls", "cat", "grep"]
 # readonly = false
 
+# ── Model Context Windows ────────────────────────────────────────
+#
+# Override known model context window sizes (in tokens). The
+# ContextMeter uses these to calculate usage percentages and
+# estimate remaining turns. Models not listed here fall back
+# to the built-in table; unknown models default to 128000.
+#
+# [models]
+# "claude-opus-4-6" = 200000
+# "claude-opus-4-6-extended" = 1000000
+# "claude-sonnet-4-6" = 200000
+# "gpt-5.2" = 400000
+# "gpt-5.2-chat" = 128000
+# "gemini-3-pro" = 1000000
+# "gemini-3-flash" = 1000000
+
 # ── Browser ──────────────────────────────────────────────────────
 # [browser]
 # domain_allowlist = []
