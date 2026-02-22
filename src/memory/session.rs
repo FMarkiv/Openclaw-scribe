@@ -74,6 +74,12 @@ pub struct SessionMeta {
     /// Optional model name (e.g. "claude-3-opus").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How many times this session has been compacted without a full rebuild.
+    /// Starts at 0 for new sessions. Increments by 1 on each compaction.
+    /// Resets to 1 after a full rebuild from primary sources.
+    /// Missing field in existing session files defaults to 0.
+    #[serde(default)]
+    pub compaction_depth: u32,
 }
 
 /// Information about a session for listing purposes.
@@ -251,6 +257,7 @@ impl SessionManager {
             last_active: now,
             provider: None,
             model: None,
+            compaction_depth: 0,
         };
         self.write_meta(&slug, &meta).await?;
 
@@ -637,10 +644,56 @@ impl SessionManager {
                     last_active: now,
                     provider: None,
                     model: None,
+                    compaction_depth: 0,
                 };
                 self.write_meta(name, &meta).await
             }
         }
+    }
+
+    // ── Compaction depth helpers ────────────────────────────────
+
+    /// Read the current compaction depth for the active session.
+    /// Returns 0 if no metadata exists or the field is absent.
+    pub async fn compaction_depth(&self) -> u32 {
+        if let Some(name) = &self.session_name {
+            self.read_meta(name)
+                .await
+                .map(|m| m.compaction_depth)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Set the compaction depth for the active session.
+    pub async fn set_compaction_depth(&self, depth: u32) -> Result<()> {
+        let name = self
+            .session_name
+            .as_ref()
+            .context("No active session")?
+            .clone();
+        let mut meta = self.read_meta(&name).await.unwrap_or_else(|_| {
+            let now = Local::now().to_rfc3339();
+            SessionMeta {
+                name: name.clone(),
+                created_at: now.clone(),
+                last_active: now,
+                provider: None,
+                model: None,
+                compaction_depth: 0,
+            }
+        });
+        meta.compaction_depth = depth;
+        self.write_meta(&name, &meta).await
+    }
+
+    /// Increment compaction depth by 1 and return the new value.
+    pub async fn increment_compaction_depth(&self) -> Result<u32> {
+        let current = self.compaction_depth().await;
+        let new_depth = current + 1;
+        self.set_compaction_depth(new_depth).await?;
+        Ok(new_depth)
     }
 
     // ── Internal helpers ─────────────────────────────────────────
@@ -1060,5 +1113,109 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content.as_deref(), Some("Legacy message"));
         assert_eq!(mgr.session_id(), Some("abc12345"));
+    }
+
+    // ── Compaction depth tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn new_session_has_zero_compaction_depth() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("depth-test").await.unwrap();
+
+        let depth = mgr.compaction_depth().await;
+        assert_eq!(depth, 0);
+    }
+
+    #[tokio::test]
+    async fn increment_compaction_depth_works() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("depth-test").await.unwrap();
+
+        let d1 = mgr.increment_compaction_depth().await.unwrap();
+        assert_eq!(d1, 1);
+
+        let d2 = mgr.increment_compaction_depth().await.unwrap();
+        assert_eq!(d2, 2);
+
+        let d3 = mgr.increment_compaction_depth().await.unwrap();
+        assert_eq!(d3, 3);
+    }
+
+    #[tokio::test]
+    async fn set_compaction_depth_works() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("depth-test").await.unwrap();
+
+        mgr.set_compaction_depth(5).await.unwrap();
+        assert_eq!(mgr.compaction_depth().await, 5);
+
+        // Reset to 1 (as after a rebuild)
+        mgr.set_compaction_depth(1).await.unwrap();
+        assert_eq!(mgr.compaction_depth().await, 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_depth_persists_across_save_load() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("depth-persist").await.unwrap();
+
+        // Increment depth
+        mgr.increment_compaction_depth().await.unwrap();
+        mgr.increment_compaction_depth().await.unwrap();
+        assert_eq!(mgr.compaction_depth().await, 2);
+
+        // Create a new manager and resume the same session
+        let mut mgr2 = SessionManager::new(_tmp.path());
+        mgr2.resume_named_session("depth-persist").await.unwrap();
+
+        // Depth should be persisted
+        assert_eq!(mgr2.compaction_depth().await, 2);
+    }
+
+    #[tokio::test]
+    async fn missing_compaction_depth_defaults_to_zero() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("old-session").await.unwrap();
+
+        // Manually write session.json without compaction_depth field
+        let meta_path = mgr.session_meta_path_for("old-session");
+        let json_without_depth = r#"{
+            "name": "old-session",
+            "created_at": "2026-02-14T10:00:00Z",
+            "last_active": "2026-02-14T10:00:00Z"
+        }"#;
+        fs::write(&meta_path, json_without_depth).await.unwrap();
+
+        // Should default to 0
+        let depth = mgr.compaction_depth().await;
+        assert_eq!(depth, 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_depth_without_active_session_is_zero() {
+        let (_tmp, mgr) = setup().await;
+        // No active session
+        assert_eq!(mgr.compaction_depth().await, 0);
+    }
+
+    #[tokio::test]
+    async fn depth_reset_after_rebuild_simulation() {
+        let (_tmp, mut mgr) = setup().await;
+        mgr.new_named_session("rebuild-test").await.unwrap();
+
+        // Simulate 3 compactions
+        mgr.increment_compaction_depth().await.unwrap();
+        mgr.increment_compaction_depth().await.unwrap();
+        mgr.increment_compaction_depth().await.unwrap();
+        assert_eq!(mgr.compaction_depth().await, 3);
+
+        // Simulate rebuild: reset to 1
+        mgr.set_compaction_depth(1).await.unwrap();
+        assert_eq!(mgr.compaction_depth().await, 1);
+
+        // Verify persisted
+        let mut mgr2 = SessionManager::new(_tmp.path());
+        mgr2.resume_named_session("rebuild-test").await.unwrap();
+        assert_eq!(mgr2.compaction_depth().await, 1);
     }
 }

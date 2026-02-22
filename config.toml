@@ -110,9 +110,14 @@ stale_days = 30
 # (A→B→A→B), and memory_store spam.  On detection it injects a
 # warning; if the agent still repeats, the loop is force-stopped.
 #
+# max_compaction_depth controls how many successive summarize-the-summary
+# compactions are allowed before triggering a full rebuild from primary
+# sources (daily notes + MEMORY.md). Default: 3.
+#
 # [agent]
 # max_identical_tool_calls = 3   # Warn after N identical calls
 # max_oscillation_depth = 4      # Window for A→B→A→B detection
+# max_compaction_depth = 3       # Rebuild from sources after N compactions
 
 # ── Security ─────────────────────────────────────────────────────
 # [security]
