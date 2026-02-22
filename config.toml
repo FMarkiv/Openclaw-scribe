@@ -113,6 +113,17 @@ compact_threshold_pct = 75
 # Entries not referenced in this many days are candidates for archival.
 stale_days = 30
 
+# Enable LLM-based semantic search as Phase 2 of memory_recall (default: true).
+# When enabled, keyword grep results are sent to the LLM for relevance scoring.
+# Only entries scoring 7+/10 are returned, ordered by score.
+# Note: scoring calls count toward normal API usage/billing.
+semantic_search = true
+
+# Model to use for semantic scoring (default: "" = use primary model).
+# Set to a cheaper/faster model to reduce costs for scoring calls.
+# Example: "claude-haiku-3" for Anthropic, "gpt-4o-mini" for OpenAI.
+scoring_model = ""
+
 # ── Structured Logging ─────────────────────────────────────────────
 #
 # Structured JSON logging writes one JSON object per line to a daily
