@@ -38,6 +38,16 @@
 # ── Web Search ───────────────────────────────────────────────────
 # brave_api_key = ""     # Or set BRAVE_API_KEY env var
 
+# ── Web Fetch Safety Limits ──────────────────────────────────────
+#
+# Controls for the web_fetch tool to prevent oversized downloads,
+# runaway redirects, and accidental binary fetches.
+#
+# [web]
+# max_fetch_bytes = 5242880    # Max response body (default: 5 MB)
+# max_redirects = 5            # Max redirect hops (default: 5)
+# fetch_timeout_secs = 30      # Total request timeout (default: 30s)
+
 # ── Telegram Bot ─────────────────────────────────────────────────
 #
 # Enable a Telegram bot channel that runs alongside the CLI.
