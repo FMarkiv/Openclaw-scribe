@@ -23,6 +23,78 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+// ── Web fetch configuration ─────────────────────────────────
+
+/// Configuration for the web fetch tool.
+///
+/// Loaded from the `[web]` section of `config.toml`. Missing fields
+/// use sensible defaults; a missing `[web]` section is fine.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebFetchConfig {
+    /// Maximum response body size in bytes before truncation (default: 5 MB).
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+    /// Maximum number of HTTP redirects to follow (default: 5).
+    #[serde(default = "default_max_redirects")]
+    pub max_redirects: usize,
+    /// Total request timeout in seconds (default: 30).
+    #[serde(default = "default_fetch_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+}
+
+fn default_max_fetch_bytes() -> usize {
+    5 * 1024 * 1024
+}
+fn default_max_redirects() -> usize {
+    5
+}
+fn default_fetch_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            max_fetch_bytes: default_max_fetch_bytes(),
+            max_redirects: default_max_redirects(),
+            fetch_timeout_secs: default_fetch_timeout_secs(),
+        }
+    }
+}
+
+/// Parse the `[web]` section from a TOML config string.
+///
+/// Returns defaults if the section is missing.
+pub fn parse_web_config(toml_str: &str) -> Result<WebFetchConfig, toml::de::Error> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        web: Option<WebFetchConfig>,
+    }
+    let wrapper: Wrapper = toml::from_str(toml_str)?;
+    Ok(wrapper.web.unwrap_or_default())
+}
+
+/// Returns `true` if the content type represents binary content that
+/// should not be downloaded (images, video, audio, archives, etc.).
+fn is_binary_content_type(content_type: &str) -> bool {
+    let ct = content_type.to_lowercase();
+    let media_type = ct.split(';').next().unwrap_or(&ct).trim();
+    media_type.starts_with("image/")
+        || media_type.starts_with("video/")
+        || media_type.starts_with("audio/")
+        || media_type == "application/octet-stream"
+        || media_type == "application/zip"
+        || media_type == "application/gzip"
+        || media_type == "application/x-gzip"
+        || media_type == "application/x-tar"
+        || media_type == "application/x-rar-compressed"
+        || media_type == "application/x-7z-compressed"
+        || media_type == "application/wasm"
+        || media_type == "application/x-executable"
+        || media_type == "application/x-sharedlib"
+}
+
 /// Approximate token count by splitting on whitespace.
 ///
 /// This is a fast heuristic — not a true tokenizer — but sufficient for
@@ -336,17 +408,22 @@ const MAX_FETCH_TOKENS: usize = 4000;
 /// to avoid context window bloat.
 pub struct WebFetchTool {
     client: Client,
+    config: WebFetchConfig,
 }
 
 impl WebFetchTool {
     pub fn new() -> Self {
+        Self::with_config(WebFetchConfig::default())
+    }
+
+    pub fn with_config(config: WebFetchConfig) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .timeout(Duration::from_secs(config.fetch_timeout_secs))
+            .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
             .user_agent("ZeroClaw/1.0 (research agent)")
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client }
+        Self { client, config }
     }
 }
 
@@ -401,11 +478,13 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let response = match self.client.get(&url).send().await {
+        let mut response = match self.client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
                 let msg = if e.is_timeout() {
                     format!("Request timed out fetching: {url}")
+                } else if e.is_redirect() {
+                    format!("Too many redirects (>{})", self.config.max_redirects)
                 } else if e.is_connect() {
                     format!("Could not connect to: {url}")
                 } else {
@@ -428,17 +507,53 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let body = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                return Ok(ToolExecutionResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                });
+        // Reject binary content types without downloading the body
+        if let Some(content_type) = response.headers().get("content-type") {
+            if let Ok(ct) = content_type.to_str() {
+                if is_binary_content_type(ct) {
+                    let content_length = response
+                        .headers()
+                        .get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown");
+                    return Ok(ToolExecutionResult {
+                        success: true,
+                        output: format!(
+                            "Binary content ({ct}, {content_length} bytes). Not fetched."
+                        ),
+                        error: None,
+                    });
+                }
             }
-        };
+        }
 
+        // Read response body with size limit
+        let max_bytes = self.config.max_fetch_bytes;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut size_truncated = false;
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    body_bytes.extend_from_slice(&chunk);
+                    if body_bytes.len() > max_bytes {
+                        body_bytes.truncate(max_bytes);
+                        size_truncated = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Ok(ToolExecutionResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to read response body: {e}")),
+                    });
+                }
+            }
+        }
+
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
         let plain_text = strip_html_tags(&body);
 
         if plain_text.is_empty() {
@@ -458,6 +573,16 @@ impl Tool for WebFetchTool {
                 "\n\n(Showing ~{MAX_FETCH_TOKENS} of ~{total_tokens} tokens)"
             ));
         }
+        if size_truncated {
+            let size_str = if max_bytes >= 1024 * 1024 {
+                format!("{}MB", max_bytes / (1024 * 1024))
+            } else {
+                format!("{} bytes", max_bytes)
+            };
+            output.push_str(&format!(
+                "\n\n[Content truncated at {size_str}. Full page is larger.]"
+            ));
+        }
 
         Ok(ToolExecutionResult {
             success: true,
@@ -475,13 +600,17 @@ impl Tool for WebFetchTool {
 /// ```rust
 /// use crate::memory::web_tools;
 ///
+/// let web_config = web_tools::parse_web_config(&config_toml).unwrap_or_default();
 /// let mut tools = tools::all_tools(&security, mem.clone(), composio_key, &config.browser);
-/// tools.extend(web_tools::all_web_tools(config.brave_api_key.clone()));
+/// tools.extend(web_tools::all_web_tools(config.brave_api_key.clone(), web_config));
 /// ```
-pub fn all_web_tools(brave_api_key: Option<String>) -> Vec<Box<dyn Tool>> {
+pub fn all_web_tools(
+    brave_api_key: Option<String>,
+    web_config: WebFetchConfig,
+) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(WebSearchTool::new(brave_api_key)),
-        Box::new(WebFetchTool::new()),
+        Box::new(WebFetchTool::with_config(web_config)),
     ]
 }
 
@@ -675,12 +804,243 @@ mod tests {
 
     #[test]
     fn all_web_tools_returns_two_tools() {
-        let tools = all_web_tools(None);
+        let tools = all_web_tools(None, WebFetchConfig::default());
         assert_eq!(tools.len(), 2);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"web_fetch"));
+    }
+
+    // ── WebFetchConfig tests ────────────────────────────────
+
+    #[test]
+    fn config_defaults_are_sensible() {
+        let config = WebFetchConfig::default();
+        assert_eq!(config.max_fetch_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.max_redirects, 5);
+        assert_eq!(config.fetch_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parse_web_config_missing_section_returns_defaults() {
+        let toml_str = r#"
+[logging]
+structured = true
+"#;
+        let config = parse_web_config(toml_str).unwrap();
+        assert_eq!(config.max_fetch_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.max_redirects, 5);
+        assert_eq!(config.fetch_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parse_web_config_partial_section_fills_defaults() {
+        let toml_str = r#"
+[web]
+max_fetch_bytes = 1048576
+"#;
+        let config = parse_web_config(toml_str).unwrap();
+        assert_eq!(config.max_fetch_bytes, 1_048_576);
+        assert_eq!(config.max_redirects, 5);
+        assert_eq!(config.fetch_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parse_web_config_full_section() {
+        let toml_str = r#"
+[web]
+max_fetch_bytes = 2097152
+max_redirects = 3
+fetch_timeout_secs = 10
+"#;
+        let config = parse_web_config(toml_str).unwrap();
+        assert_eq!(config.max_fetch_bytes, 2_097_152);
+        assert_eq!(config.max_redirects, 3);
+        assert_eq!(config.fetch_timeout_secs, 10);
+    }
+
+    // ── Binary content-type detection ───────────────────────
+
+    #[test]
+    fn binary_content_type_detects_images() {
+        assert!(is_binary_content_type("image/png"));
+        assert!(is_binary_content_type("image/jpeg"));
+        assert!(is_binary_content_type("image/gif"));
+        assert!(is_binary_content_type("Image/PNG")); // case-insensitive
+    }
+
+    #[test]
+    fn binary_content_type_detects_media() {
+        assert!(is_binary_content_type("video/mp4"));
+        assert!(is_binary_content_type("audio/mpeg"));
+    }
+
+    #[test]
+    fn binary_content_type_detects_archives() {
+        assert!(is_binary_content_type("application/zip"));
+        assert!(is_binary_content_type("application/gzip"));
+        assert!(is_binary_content_type("application/octet-stream"));
+    }
+
+    #[test]
+    fn binary_content_type_ignores_charset_params() {
+        assert!(is_binary_content_type("image/png; charset=utf-8"));
+        assert!(is_binary_content_type("application/octet-stream; name=file.bin"));
+    }
+
+    #[test]
+    fn binary_content_type_allows_text() {
+        assert!(!is_binary_content_type("text/html"));
+        assert!(!is_binary_content_type("text/plain"));
+        assert!(!is_binary_content_type("text/html; charset=utf-8"));
+        assert!(!is_binary_content_type("application/json"));
+        assert!(!is_binary_content_type("application/xml"));
+        assert!(!is_binary_content_type("application/javascript"));
+    }
+
+    // ── Integration tests with mock server ──────────────────
+
+    #[tokio::test]
+    async fn fetch_truncates_at_size_limit() {
+        let mut server = mockito::Server::new_async().await;
+        // Create a body larger than our small limit
+        let big_body = "x".repeat(500);
+        let mock = server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body(&big_body)
+            .create_async()
+            .await;
+
+        let config = WebFetchConfig {
+            max_fetch_bytes: 100,
+            ..Default::default()
+        };
+        let tool = WebFetchTool::with_config(config);
+        let result = tool
+            .execute(json!({"url": format!("{}/big", server.url())}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("[Content truncated at 100 bytes. Full page is larger.]"),
+            "output was: {}",
+            result.output
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_does_not_truncate_small_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/small")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Hello world")
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": format!("{}/small", server.url())}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(!result.output.contains("[Content truncated"));
+        assert!(result.output.contains("Hello world"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_binary_content_type() {
+        let mut server = mockito::Server::new_async().await;
+        let body = "fake png data that is not real";
+        let mock = server
+            .mock("GET", "/image.png")
+            .with_status(200)
+            .with_header("content-type", "image/png")
+            .with_header("content-length", &body.len().to_string())
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": format!("{}/image.png", server.url())}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("Binary content"),
+            "output was: {}",
+            result.output
+        );
+        assert!(result.output.contains("image/png"));
+        assert!(result.output.contains("Not fetched"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_octet_stream() {
+        let mut server = mockito::Server::new_async().await;
+        let body = "binary data";
+        let mock = server
+            .mock("GET", "/file.bin")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_header("content-length", &body.len().to_string())
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": format!("{}/file.bin", server.url())}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("Binary content"));
+        assert!(result.output.contains("application/octet-stream"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_redirect_limit_exceeded() {
+        let mut server = mockito::Server::new_async().await;
+        // Create a redirect loop: /redir -> /redir (self-redirect)
+        let url = format!("{}/redir", server.url());
+        // reqwest sends 1 original request + max_redirects follow-ups
+        let _mock = server
+            .mock("GET", "/redir")
+            .expect_at_least(1)
+            .with_status(302)
+            .with_header("location", &url)
+            .create_async()
+            .await;
+
+        let config = WebFetchConfig {
+            max_redirects: 2,
+            ..Default::default()
+        };
+        let tool = WebFetchTool::with_config(config);
+        let result = tool
+            .execute(json!({"url": url}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("Too many redirects (>2)"),
+            "error was: {err}"
+        );
     }
 
     // ── Brave API response deserialization ───────────────────
